@@ -1,0 +1,175 @@
+---
+title: "exerciseGenerator: AI Exercise Creation Worker"
+sidebarTitle: "Exercise Generator"
+description: "SQS worker that generates new math exercises for a given topic on teacher request, using Claude Haiku with forced tool_use to produce up to 10 structured exercises."
+---
+
+The `exerciseGenerator` worker creates new math exercises on demand in response to teacher requests. When a teacher asks for additional practice material on a specific subdomain, the backend enqueues a `GenerateExercisesMessage` to the `exercise-generate-queue`. The worker receives it, resolves the subdomain and its parent topic from Postgres, fetches human-readable error descriptions for the requested error codes, and calls `HaikuExerciseGenerator` — a Claude Haiku (claude-haiku-4-5) adapter that uses forced `generate_exercises` tool_use to produce up to 10 fully structured exercises in a single LLM call. Each generated exercise is deduplicated against existing problems and persisted to Postgres with IRT parameters, solution steps, and target error codes. A cost event is recorded after every invocation.
+
+## Trigger & configuration
+
+<CardGroup cols={2}>
+  <Card title="Queue" icon="list-check">
+    SQS exercise-generate queue  
+    ARN from env `SQS_EXERCISE_GENERATE_ARN`
+  </Card>
+  <Card title="Lambda settings" icon="bolt">
+    Timeout: **300 s** · Memory: **512 MB**  
+    Handler: `src.pipeline.exercise_generator.handler`
+  </Card>
+</CardGroup>
+
+| Setting | Value |
+|---|---|
+| `batchSize` | `1` |
+| `functionResponseType` | `ReportBatchItemFailures` |
+
+<Note>
+  Batch size is fixed at **1** because each message triggers a multi-call LLM job (one Haiku tool-use call) followed by per-exercise Postgres writes. Processing more than one request concurrently in the same Lambda invocation would conflate costs and make partial-failure tracking ambiguous.
+</Note>
+
+## SQS message body — `GenerateExercisesMessage`
+
+```json
+{
+  "subdomain_code": "ALG-LINEAR-EQ",
+  "grade_level": 8,
+  "target_error_codes": ["ERR-SIGN-CHANGE", "ERR-DIV-BOTH-SIDES"],
+  "count": 5,
+  "trace_id": "trace-uuid-or-empty-string"
+}
+```
+
+<ParamField body="subdomain_code" type="string" required>
+  The subdomain for which exercises should be generated (e.g. `ALG-LINEAR-EQ`). The worker resolves this to a `subdomain_id` and its parent `topic_id` in Postgres.
+</ParamField>
+
+<ParamField body="grade_level" type="integer" required>
+  Target school grade level, between `1` and `12` inclusive. Passed to the generator so Claude can calibrate difficulty and vocabulary.
+</ParamField>
+
+<ParamField body="target_error_codes" type="list[string]" required>
+  One or more error codes from the taxonomy that the generated exercises should specifically address. At least one entry is required.
+</ParamField>
+
+<ParamField body="count" type="integer" required>
+  Number of exercises to generate, between `1` and `10` inclusive.
+</ParamField>
+
+<ParamField body="trace_id" type="string">
+  Optional trace identifier for log correlation. Defaults to an empty string.
+</ParamField>
+
+## Execution flow
+
+<Steps>
+  <Step title="Resolve subdomain and topic">
+    The service calls `repo.load_subdomain(subdomain_code)` to retrieve the `subdomain_id` and description. If the subdomain is not found but `target_error_codes` is non-empty, a fallback lookup via `repo.load_subdomain_for_error_code(first_code)` is attempted and logged as a warning.
+
+    If neither lookup succeeds, a terminal `SubdomainNotFoundError` is raised — **the message is not retried**.
+
+    Similarly, `repo.topic_id_for_subdomain(subdomain_id)` must return a valid topic; if not, a terminal `GeneratorError` is raised.
+  </Step>
+  <Step title="Fetch error descriptions">
+    `repo.load_error_descriptions(target_error_codes)` retrieves human-readable descriptions for the requested error codes. These are passed alongside the codes so Claude's prompt is semantically grounded rather than relying on opaque identifiers.
+  </Step>
+  <Step title="Call HaikuExerciseGenerator">
+    `HaikuExerciseGenerator.generate(...)` makes a single `claude-haiku-4-5` call with:
+    - `max_tokens: 4096`
+    - `temperature: 1.0` (creative generation)
+    - `cache_control: ephemeral` on the static system prompt
+    - `tool_choice: {"type": "tool", "name": "generate_exercises"}` to force structured output
+
+    The model returns a `GenerateExercisesTool` payload containing up to `count` exercises.
+  </Step>
+  <Step title="Deduplicate and persist">
+    For each generated exercise, `repo.problem_exists(problem_latex, subdomain_id)` checks for an exact duplicate before inserting. Duplicates are skipped and logged. Non-duplicate exercises are written to Postgres via `repo.persist_exercise(...)` with all IRT and metadata fields.
+  </Step>
+  <Step title="Record cost event">
+    After persistence, `repo.save_cost_event(...)` records input/output tokens and the estimated USD cost for the invocation. A failure to save the cost event is logged as a warning but does not fail the message.
+  </Step>
+</Steps>
+
+## Generated exercise schema — `GeneratedExercise`
+
+```python
+class GeneratedExercise(BaseModel):
+    problem_latex: str                   # LaTeX-formatted problem statement
+    correct_answer_latex: str            # LaTeX-formatted canonical answer
+    solution_steps_latex: list[str]      # ordered step-by-step solution in LaTeX
+    irt_a: float                         # IRT discrimination parameter [0.5, 3.0]
+    irt_b: float                         # IRT difficulty parameter [-3.0, 3.0]
+    target_error_codes: list[str]        # error codes this exercise targets
+```
+
+<ParamField body="problem_latex" type="string">
+  The exercise problem rendered in LaTeX. Must be non-empty.
+</ParamField>
+
+<ParamField body="correct_answer_latex" type="string">
+  The canonical correct answer in LaTeX. Must be non-empty.
+</ParamField>
+
+<ParamField body="solution_steps_latex" type="list[str]">
+  Ordered list of solution steps in LaTeX, suitable for display in a step-by-step walkthrough.
+</ParamField>
+
+<ParamField body="irt_a" type="float">
+  IRT 2PL discrimination parameter. Seeded by the model in `[0.5, 3.0]`; recalibrated nightly by `nightlyIrt` once the exercise accumulates ≥50 attempts.
+</ParamField>
+
+<ParamField body="irt_b" type="float">
+  IRT 2PL difficulty parameter. Seeded by the model in `[-3.0, 3.0]`; recalibrated nightly.
+</ParamField>
+
+<ParamField body="target_error_codes" type="list[str]">
+  Error codes from the taxonomy that this exercise is designed to elicit or test.
+</ParamField>
+
+## Claude Haiku tool_use
+
+The generator makes a **single** Anthropic API call per message using forced `tool_use`:
+
+```python
+response = await client.messages.create(
+    model="claude-haiku-4-5",
+    max_tokens=4096,
+    temperature=1.0,
+    system=[{
+        "type": "text",
+        "text": GENERATE_SYSTEM,
+        "cache_control": {"type": "ephemeral"},   # shared across warm-container calls
+    }],
+    tools=[GENERATE_EXERCISES_TOOL],
+    tool_choice={"type": "tool", "name": "generate_exercises"},
+    messages=[{"role": "user", "content": user_text}],
+)
+```
+
+The `cache_control: ephemeral` annotation on the system prompt means all calls from the same warm Lambda container reuse the cached system block, reducing token billing for repeated teacher requests.
+
+If the model returns a `tool_use` block but the payload fails Pydantic validation, the generator logs a warning and returns an empty exercise list — the message is completed successfully with zero persisted exercises.
+
+## Worker-level outcome — `GenerateExercisesResult`
+
+```python
+class GenerateExercisesResult(BaseModel):
+    subdomain_code: str
+    requested: int      # count from the message
+    generated: int      # exercises returned by Claude
+    persisted: int      # exercises actually written to Postgres (after dedup)
+    failure_reason: str | None
+```
+
+## Partial batch failure handling
+
+The handler distinguishes between two failure modes:
+
+| Exception | Behaviour |
+|---|---|
+| `GeneratorError` (terminal) | Message is **not** added to `batchItemFailures`. It is silently dropped — no retry. |
+| Any other exception | `{"itemIdentifier": message_id}` is added to `batchItemFailures`. SQS redelivers the message. |
+
+<Warning>
+  Terminal errors (`SubdomainNotFoundError`, `GeneratorError`) indicate a data problem (unknown subdomain, missing topic mapping) that will not self-resolve. Retrying would bill the LLM again for the same result. These messages are discarded intentionally.
+</Warning>

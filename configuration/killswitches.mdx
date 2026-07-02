@@ -1,0 +1,146 @@
+---
+title: "SSM Kill-Switches: Pausing Workers Without Redeployment"
+sidebarTitle: "Kill-Switches"
+description: "How to pause any Innova AI Engine worker in production without a code redeployment using AWS SSM Parameter Store kill-switch flags."
+---
+
+Innova AI Engine exposes a set of SSM Parameter Store kill-switches that let operators pause any costly worker stage instantly — without building a new container image, without a Serverless Framework redeploy, and without touching any code. Setting a parameter to `"true"` causes the corresponding worker to stop calling the LLM provider and return its SQS messages to the queue for a later retry, so no work is permanently lost.
+
+---
+
+## How It Works
+
+The mechanism is implemented in `src/shared/killswitch.py`. Two functions make up the entire interface:
+
+### `is_paused`
+
+```python
+def is_paused(param_name: str) -> bool:
+    """Read an SSM killswitch flag. Fails open (returns False) on any SSM error so a
+    transient SSM outage never blocks the pipeline silently — the cost guard is a
+    safety brake, not a correctness gate."""
+    try:
+        settings = get_settings()
+        ssm = boto3.client("ssm", region_name=settings.app_aws_region)
+        resp = ssm.get_parameter(Name=param_name)
+        param = resp["Parameter"]
+        return str(param["Value"]).lower() == "true"
+    except Exception:
+        return False
+```
+
+The function reads the named SSM parameter and returns `True` only if its value is exactly `"true"` (case-insensitive). Crucially, **it fails open**: if SSM is unreachable, returns an unexpected error, or the parameter does not exist, `is_paused` returns `False` and the worker proceeds normally. A transient SSM outage will never silently halt the pipeline.
+
+### `ensure_not_paused`
+
+```python
+def ensure_not_paused(param_name: str, *, trace_id: str = "") -> None:
+    """Raise `PausedError` when the killswitch is active (call before each paid API call)."""
+    if is_paused(param_name):
+        logger.warning("killswitch_active", param=param_name, trace_id=trace_id)
+        raise PausedError(f"paused by killswitch {param_name}")
+```
+
+Workers call `ensure_not_paused` immediately before each paid model API call, passing their kill-switch parameter name and a `trace_id` for structured log correlation. If the switch is active, a `killswitch_active` warning is logged and `PausedError` is raised.
+
+---
+
+## `PausedError` and SQS Retry Behavior
+
+`PausedError` is a plain `Exception` subclass. When it propagates out of a worker handler, the Lambda SQS integration treats the affected message as a `batchItemFailure` (because all workers configure `functionResponseType: ReportBatchItemFailures` in `serverless.yml`). The message is **returned to the SQS queue** — not dropped, not sent to the DLQ — and will be retried after the queue's visibility timeout expires.
+
+<Note>
+  This means pausing a worker does not lose any work. Messages accumulate in the queue while the kill-switch is active and are processed automatically once the switch is cleared.
+</Note>
+
+---
+
+## Kill-Switch Reference
+
+The following table lists every kill-switch in the system, its default SSM path, the environment variable that overrides the path, and which worker(s) it affects.
+
+| SSM Parameter | Env Var | Workers Affected |
+|---|---|---|
+| `/innova/llm/paused` | `SSM_LLM_PAUSED_PARAM` | `llmClassifier` — stops Claude error classification calls |
+| `/innova/ocr/paused` | `SSM_OCR_PAUSED_PARAM` | `ocrWorker` — stops Gemini and Claude OCR vision calls |
+| `/innova/guides/ingest_paused` | `SSM_GUIDES_INGEST_PAUSED_PARAM` | `guideIngest` — stops PDF extraction (Gemini precheck + Claude extract) |
+| `/innova/guides/solution_paused` | `SSM_GUIDES_SOLUTION_PAUSED_PARAM` | `solutionGenerator` — stops solution key generation (Claude Sonnet) |
+| `/innova/guides/grading_paused` | `SSM_GUIDES_GRADING_PAUSED_PARAM` | `submissionGrader` — stops submission transcription and grading |
+| `/innova/guides/grading_cheap_mode` | `SSM_GUIDES_CHEAP_MODE_PARAM` | `submissionGrader` — downgrades grading to a cheaper model instead of pausing |
+
+<Note>
+  The Lambda IAM role defined in `serverless.yml` grants `ssm:GetParameter` on `arn:aws:ssm:us-east-1:*:parameter/innova/*`. All kill-switch parameters fall under this prefix, so no additional IAM changes are needed to add new switches under `/innova/`.
+</Note>
+
+---
+
+## Activating a Kill-Switch
+
+Use the AWS CLI to set any parameter to `"true"`. The change takes effect on the **next** SQS message processed — there is no need to restart or redeploy the Lambda function.
+
+```bash
+aws ssm put-parameter \
+  --name "/innova/llm/paused" \
+  --value "true" \
+  --type "String" \
+  --overwrite \
+  --region us-east-1
+```
+
+Replace `--name` with the SSM path for the worker you want to pause (see the table above).
+
+---
+
+## Clearing a Kill-Switch
+
+Set the parameter back to `"false"` to resume normal processing. Messages that accumulated in the SQS queue while the switch was active will be picked up automatically.
+
+```bash
+aws ssm put-parameter \
+  --name "/innova/llm/paused" \
+  --value "false" \
+  --type "String" \
+  --overwrite \
+  --region us-east-1
+```
+
+---
+
+## Cheap Mode vs. Full Pause
+
+The `submissionGrader` worker has two cost levers, not one:
+
+<CardGroup cols={2}>
+  <Card title="Full pause (/innova/guides/grading_paused)" icon="pause">
+    Sets `SSM_GUIDES_GRADING_PAUSED_PARAM` to `"true"`. All submission grading stops immediately. Messages queue up and are retried once the switch is cleared. Use this when you need to stop all spending on grading.
+  </Card>
+  <Card title="Cheap mode (/innova/guides/grading_cheap_mode)" icon="circle-dollar-to-slot">
+    Sets `SSM_GUIDES_CHEAP_MODE_PARAM` to `"true"`. Grading continues but uses a cheaper model. Submissions are graded with reduced quality rather than queued. Use this when you need to reduce — not eliminate — grading cost.
+  </Card>
+</CardGroup>
+
+<Warning>
+  Enabling cheap mode degrades grading model quality. Before activating it in production, review the grading accuracy metrics in the `Innova/Guides` CloudWatch namespace to understand the accuracy trade-off at your current submission volume.
+</Warning>
+
+---
+
+## Operational Runbook
+
+<Steps>
+  <Step title="Identify the worker to pause">
+    Check the kill-switch reference table above to find the SSM path for the worker generating unexpected cost or errors.
+  </Step>
+  <Step title="Set the kill-switch">
+    Run the `aws ssm put-parameter` command with `--value "true"` and the correct `--name`. Verify in the AWS console that the parameter was updated.
+  </Step>
+  <Step title="Monitor the queue">
+    In the AWS SQS console, confirm that the queue depth is growing (messages are being returned) rather than draining. This confirms the kill-switch is active.
+  </Step>
+  <Step title="Investigate and resolve">
+    Diagnose the root cause using CloudWatch Logs (structured JSON logs include `trace_id`, token usage, and cost per call). Fix the issue, update pricing tables if needed, or adjust environment variables.
+  </Step>
+  <Step title="Clear the kill-switch">
+    Run the `aws ssm put-parameter` command with `--value "false"`. The worker will resume processing queued messages on its next poll cycle.
+  </Step>
+</Steps>

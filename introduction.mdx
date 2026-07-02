@@ -1,0 +1,79 @@
+---
+title: "Innova AI Engine: Async ML Workers for EdTech"
+sidebarTitle: "Introduction"
+description: "Innova AI Engine runs BKT/IRT calibration, LLM error classification, OCR, and document AI for the SuperProfe platform as AWS Lambda container images."
+---
+
+Innova AI Engine is the **asynchronous AI backbone** of the SuperProfe platform — a Chilean EdTech system that helps teachers understand exactly which procedural math errors their students are making before a test. Rather than exposing ML logic through the main API, the engine runs as a fleet of AWS Lambda container images that consume events from SQS queues, call hosted model providers (Anthropic Claude and Google Gemini), and write all results back to a shared Postgres database. The `innova-backend-serverless` API owns the queues, S3 buckets, and primary database; this engine's only job is to consume those events and produce structured, auditable outputs.
+
+## What the engine does
+
+The engine handles six distinct families of ML work, each deployed as one or more Lambda functions:
+
+<CardGroup cols={2}>
+  <Card title="Knowledge Tracing" icon="chart-line">
+    Nightly **BKT** (Bayesian Knowledge Tracing) parameter calibration via grid search and **IRT 2PL** item calibration via `scipy.optimize` (L-BFGS-B). Recalibrates four per-topic BKT parameters (`p_l0`, `p_transit`, `p_slip`, `p_guess`) and per-exercise IRT discrimination and difficulty values against the full attempt history.
+  </Card>
+  <Card title="Error Classification" icon="tags">
+    Classifies `UNCLASSIFIED` student attempts against a proprietary 2,600+ procedural-error taxonomy aligned to the Chilean curriculum (17 domains). Claude Haiku processes batches of 20 with ephemeral prompt caching and forced `tool_use`; Sonnet is used as a fallback when confidence is below threshold.
+  </Card>
+  <Card title="Document AI — Guides" icon="file-pdf">
+    Full pipeline for teacher-uploaded worksheet PDFs: **guideIngest** extracts questions (Gemini precheck → Claude extract → figure rendering via pypdfium2), **solutionGenerator** builds step-by-step solution keys, and **submissionGrader** transcribes and grades handwritten student submissions.
+  </Card>
+  <Card title="Vision OCR" icon="eye">
+    Reads handwritten student work using a two-tier strategy: Gemini 2.5 Flash as the primary OCR engine, escalating to Claude vision when the transcription confidence score falls below the configured threshold. Output is structured LaTeX steps with a per-step confidence score.
+  </Card>
+  <Card title="Exercise Generation" icon="pencil">
+    Generates new exercises for a given topic on teacher demand. Uses Claude Haiku with forced tool use to produce up to 10 exercises per invocation, then writes them directly to Postgres.
+  </Card>
+  <Card title="Alerting & Evaluation" icon="bell">
+    **hourlyAlerts** fires every hour via EventBridge cron, scanning mastery levels and guide completion state to detect at-risk students and raise deduplicated `TeacherAlert` records. **gradingEval** is an offline grading-quality scorer with a CLI gate used before production releases.
+  </Card>
+</CardGroup>
+
+## Clean Architecture pattern
+
+Every worker package in the engine follows the same four-layer **Clean Architecture** structure:
+
+| Layer | File(s) | Role |
+|-------|---------|------|
+| **Domain** | `domain.py` | Pure business logic — zero I/O, zero framework imports. BKT grid search, IRT MLE, grading rubrics, and classifier logic all live here. Fully unit-testable without mocks. |
+| **Ports** | `ports.py` | Protocol classes (structural typing) that define the I/O contracts the domain logic depends on: `AttemptRepoPort`, `MathOCRPort`, `LLMClassifierPort`, etc. |
+| **Adapters** | `src/shared/` | Concrete implementations of ports: `asyncpg` for Postgres, `boto3` for SQS/S3, `anthropic` SDK for Claude, `google-genai` for Gemini. Adapters are the only place that imports external libraries. |
+| **Handler** | `src/pipeline/<worker>.handler` | Thin Lambda entrypoint. Reads the SQS event or cron payload, instantiates adapters with settings from `pydantic-settings`, calls the domain, and returns. No business logic here. |
+
+This structure means that all math, all classification logic, and all grading rules can be tested without a live database, queue, or API key — mocked adapters satisfy the port protocols.
+
+## Technology choices
+
+The engine is deliberately **dependency-light**:
+
+- **Python 3.11** with `from __future__ import annotations` and full type hints throughout.
+- **No PyTorch. No scikit-learn.** All deterministic math (BKT grid search, IRT 2PL MLE, Fisher information) runs on **scipy + numpy**. Hosted LLMs handle everything that would otherwise require neural nets.
+- **Anthropic Claude** (Haiku as default, Sonnet as fallback/escalation) for error classification, solution generation, submission grading, and exercise generation.
+- **Google Gemini 2.5 Flash** for vision OCR and PDF precheck in the guide pipeline.
+- **asyncpg** for direct, async Postgres access with connection pooling — no ORM.
+- **structlog** for structured JSON logging with trace IDs, token counts, and per-call cost metadata baked into every log line.
+- **Pydantic v2** and `pydantic-settings` for config validation and schema enforcement.
+- **Serverless Framework** + Lambda container images (`Dockerfile.lambda`) for deployment — native binary dependencies (`pypdfium2`, `pillow`) are installed inside the image.
+
+<Note>
+  `gemini-2.0-flash` was retired on 2026-06-01. The default model is now `gemini-2.5-flash`, configurable via the `GEMINI_MODEL` environment variable without code changes.
+</Note>
+
+## Where to go next
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Install dependencies, configure environment variables, and invoke your first worker locally in under 10 minutes.
+  </Card>
+  <Card title="Architecture" icon="diagram-project" href="/architecture">
+    Deep dive into the SQS event flow, Lambda topology, Clean Architecture layers, and the guides v9 pipeline.
+  </Card>
+  <Card title="Workers Overview" icon="grid" href="/workers/overview">
+    Reference for all 10 Lambda functions: triggers, timeouts, memory, and batch sizes.
+  </Card>
+  <Card title="BKT Concepts" icon="graduation-cap" href="/concepts/bkt">
+    Theoretical foundation of Bayesian Knowledge Tracing and how the nightly calibration job works.
+  </Card>
+</CardGroup>

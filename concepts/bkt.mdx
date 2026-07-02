@@ -1,0 +1,193 @@
+---
+title: "Bayesian Knowledge Tracing: Skill Mastery Calibration"
+sidebarTitle: "BKT"
+description: "How Innova AI Engine fits BKT parameters nightly using brute-force grid search over p_l0, p_transit, p_slip, and p_guess across student attempt history."
+---
+
+Bayesian Knowledge Tracing (BKT), introduced by Corbett & Anderson (1995), models a student's mastery of a skill as a hidden binary state — either the student *knows* the skill or they don't. At each practice opportunity the model updates the probability of mastery using Bayes' rule applied to whether the student answered correctly or incorrectly. Innova's `nightlyBkt` Lambda (cron `0 7 * * ? *`) reads up to 30 days of attempt history per skill, runs a brute-force grid search to find the four BKT parameters that maximise log-likelihood over all students' attempt sequences, and writes the results back to the `skill_bkt_params` table in Postgres. The online per-attempt update itself runs in the TypeScript backend in real time; this engine owns only the **nightly recalibration**.
+
+## The Four BKT Parameters
+
+Every skill carries exactly four real-valued parameters that together define how students learn and how errors are distributed:
+
+<CardGroup cols={2}>
+  <Card title="p_l0 — Prior Knowledge" icon="graduation-cap">
+    Probability that a student already knows the skill **before** their first attempt. Range `[0, 1]`. A topic that is entirely new to 3rd-graders has a low `p_l0`; revision material has a higher value.
+  </Card>
+  <Card title="p_transit — Learning Rate" icon="arrow-trend-up">
+    Probability of transitioning from *unknown* to *known* on a single practice opportunity. Range `[0, 1]`. A skill that clicks quickly (e.g. carry addition) has a higher `p_transit` than one requiring many repetitions.
+  </Card>
+  <Card title="p_slip — Slip Probability" icon="triangle-exclamation">
+    Probability that a student who **does** know the skill answers incorrectly anyway (e.g. a careless mistake). Range `[0, 0.5]`. High slip signals noisy or ambiguous items.
+  </Card>
+  <Card title="p_guess — Guess Probability" icon="dice">
+    Probability that a student who **does not** know the skill answers correctly anyway (e.g. lucky guess or process of elimination). Range `[0, 0.5]`. High guess inflates apparent mastery.
+  </Card>
+</CardGroup>
+
+<Warning>
+  The identifiability constraint `p_slip + p_guess < 1.0` is enforced at the schema level. If this constraint is violated the BKT model is unidentifiable — the two error rates are indistinguishable from each other. `BktParams` raises a `ValueError` at construction time if the constraint is broken.
+</Warning>
+
+## Prediction Formula
+
+Given the current probability of mastery `p_known`, the probability that the student answers the next item **correctly** is:
+
+```
+p_correct = p_known × (1 − p_slip) + (1 − p_known) × p_guess
+```
+
+There are two ways to get a correct answer: the student knows the skill and does not slip, or the student does not know it but guesses correctly. These two paths are mutually exclusive and exhaustive.
+
+## Online Update Formula
+
+After observing whether the student answered correctly or incorrectly, the backend updates `p_known` using the closed-form BKT update implemented in `update.py`:
+
+```python
+def bkt_update(
+    p_known: float,
+    p_transit: float,
+    p_slip: float,
+    p_guess: float,
+    obs: bool,
+) -> float:
+    """Closed-form BKT Bayesian update. Reference implementation (production uses TS port)."""
+    if obs:
+        denom = p_known * (1.0 - p_slip) + (1.0 - p_known) * p_guess
+        evidence = (p_known * (1.0 - p_slip)) / denom if denom > 0.0 else 0.0
+    else:
+        denom = p_known * p_slip + (1.0 - p_known) * (1.0 - p_guess)
+        evidence = (p_known * p_slip) / denom if denom > 0.0 else 0.0
+    return evidence + (1.0 - evidence) * p_transit
+```
+
+The formula first computes the Bayesian posterior probability of mastery given the observation (`evidence`), then applies the transition rate to account for the possibility that the student learned during this attempt regardless of outcome.
+
+<Note>
+  This Python implementation is the **reference** version used for testing and calibration. The production per-attempt update runs in a TypeScript port inside the backend Lambda for sub-5ms latency.
+</Note>
+
+## Nightly Calibration: Grid Search
+
+Because BKT has only four parameters with bounded ranges, Innova uses **brute-force grid search** rather than gradient-based optimisation. This avoids local minima, is trivially parallelisable, and produces reproducible results without initialisation sensitivity.
+
+<Steps>
+  <Step title="Filter attempts">
+    Load all `AttemptObservation` records for the skill from the last **30 days**. If fewer than **50 attempts** exist across all students, calibration is skipped and the existing parameters remain unchanged.
+  </Step>
+  <Step title="Group by student">
+    Group observations by `student_id` and sort each group by `timestamp` ascending so the sequential structure of each student's practice session is preserved.
+  </Step>
+  <Step title="Grid search">
+    Iterate over every combination of `(p_l0, p_transit, p_slip, p_guess)` from the grid `[0.05, 0.10, …, 0.95]` (step 0.05, 19 values per parameter). Combinations where `p_slip + p_guess ≥ 1.0` are skipped. For each valid combination, compute the total log-likelihood over all students' sequences.
+  </Step>
+  <Step title="Select best params">
+    Return the combination with the highest (least-negative) log-likelihood as the new `BktParams`.
+  </Step>
+  <Step title="Write back">
+    The nightly handler upserts the result into the `skill_bkt_params` table in Postgres, keyed by `skill_id`. The backend picks up the updated parameters on the next request.
+  </Step>
+</Steps>
+
+### The `calibrate_skill` Function
+
+```python
+def calibrate_skill(attempts: list[AttemptObservation]) -> BktParams:
+    """
+    Brute-force grid search over (p_l0, p_transit, p_slip, p_guess).
+    Grid: [0.05, 0.50] step 0.05. Minimizes negative log-likelihood.
+    """
+    grid = [round(x, 2) for x in np.arange(0.05, 0.96, 0.05).tolist()]
+    best_params: tuple[float, float, float, float] | None = None
+    best_ll = float("-inf")
+
+    for p_l0, p_transit, p_slip, p_guess in product(grid, grid, grid, grid):
+        if p_slip + p_guess >= 1.0:
+            continue
+        ll = _compute_log_likelihood(attempts, p_l0, p_transit, p_slip, p_guess)
+        if ll > best_ll:
+            best_ll = ll
+            best_params = (p_l0, p_transit, p_slip, p_guess)
+
+    if best_params is None:
+        return BktParams(p_l0=0.3, p_transit=0.1, p_slip=0.1, p_guess=0.2, log_likelihood=best_ll)
+
+    return BktParams(
+        p_l0=best_params[0],
+        p_transit=best_params[1],
+        p_slip=best_params[2],
+        p_guess=best_params[3],
+        log_likelihood=best_ll,
+    )
+```
+
+<Tip>
+  The grid covers `[0.05, 0.95]` in steps of `0.05` — 19 values per dimension. With the identifiability constraint applied, the search space is roughly **19⁴ × ~0.9 ≈ 117,000 combinations** per skill. Each combination requires a single sequential pass over the attempt list, making the total runtime proportional to `n_attempts × 117K`.
+</Tip>
+
+## The `BktParams` Schema
+
+```python
+class BktParams(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    p_l0: float = Field(..., ge=0.0, le=1.0, description="Prior P(knows skill)")
+    p_transit: float = Field(..., ge=0.0, le=1.0, description="P(learns per opportunity)")
+    p_slip: float = Field(..., ge=0.0, le=0.5, description="P(fails when knows)")
+    p_guess: float = Field(..., ge=0.0, le=0.5, description="P(correct when doesn't know)")
+    log_likelihood: float | None = None
+```
+
+<ParamField path="p_l0" type="float" required>
+  Prior probability that the student already knows the skill. Bounded `[0.0, 1.0]`.
+</ParamField>
+
+<ParamField path="p_transit" type="float" required>
+  Per-opportunity learning rate — probability of transitioning from unknown to known. Bounded `[0.0, 1.0]`.
+</ParamField>
+
+<ParamField path="p_slip" type="float" required>
+  Probability of a slip error when the skill is known. Bounded `[0.0, 0.5]`. The 0.5 ceiling is part of the identifiability constraint alongside `p_guess`.
+</ParamField>
+
+<ParamField path="p_guess" type="float" required>
+  Probability of a correct answer when the skill is unknown. Bounded `[0.0, 0.5]`.
+</ParamField>
+
+<ParamField path="log_likelihood" type="float | None">
+  The log-likelihood score achieved by this parameter combination during grid search. `None` for manually seeded or default parameter sets.
+</ParamField>
+
+## The `AttemptObservation` Schema
+
+```python
+class AttemptObservation(BaseModel):
+    student_id: str
+    skill_id: str
+    is_correct: bool
+    timestamp: float
+```
+
+<ParamField path="student_id" type="str" required>
+  Identifies which student produced this attempt. Observations are grouped by this field before computing per-student log-likelihood sequences.
+</ParamField>
+
+<ParamField path="skill_id" type="str" required>
+  The skill being traced. All observations passed to `calibrate_skill` must belong to the same skill.
+</ParamField>
+
+<ParamField path="is_correct" type="bool" required>
+  Whether the student answered correctly on this attempt.
+</ParamField>
+
+<ParamField path="timestamp" type="float" required>
+  Unix epoch timestamp. Used to sort observations within a student's sequence chronologically and to apply the 30-day data window.
+</ParamField>
+
+## Division of Responsibility
+
+<Info>
+  **Backend (TypeScript Lambda)** — runs `bkt_update` in real time after every student attempt, updating the stored `p_known` per student per skill. Latency target: < 5 ms.
+
+  **AI Engine (this repo)** — runs `calibrate_skill` nightly via the `nightlyBkt` EventBridge cron at 07:00 UTC. It reads the last 30 days of attempts from Postgres, searches for optimal parameters, and upserts results to `skill_bkt_params`. The backend picks up new parameters on its next cold start or config refresh.
+</Info>

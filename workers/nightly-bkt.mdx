@@ -1,0 +1,157 @@
+---
+title: "nightlyBkt: BKT Parameter Calibration Worker"
+sidebarTitle: "Nightly BKT"
+description: "EventBridge cron worker that recalibrates BKT parameters for every active skill nightly at 07:00 UTC using brute-force grid search over 30-day attempt history."
+---
+
+`nightlyBkt` is the nightly calibration job that keeps the platform's Bayesian Knowledge Tracing model accurate over time. It runs once every 24 hours, fetches all attempts from the last 30 days for each active skill, and performs a brute-force grid search over the four BKT parameters — `p_l0`, `p_transit`, `p_slip`, and `p_guess` — choosing the combination that maximises the log-likelihood of the observed attempt sequences. The results are upserted into `skill_bkt_params`, which the backend reads on each student attempt to perform the online BKT update. Because the calibration is fully deterministic (scipy + numpy, no LLM calls), the function uses no external API keys and never touches S3.
+
+## Trigger and configuration
+
+| Property | Value |
+|---|---|
+| Trigger | EventBridge scheduled rule |
+| Schedule | `cron(0 7 * * ? *)` — every day at **07:00 UTC** |
+| Timeout | 900 s |
+| Memory | 1024 MB |
+| Handler | `src.pipeline.nightly_bkt.handler` |
+| Event payload | _(none read — scheduled invocation)_ |
+
+<Note>
+  This function runs 15 minutes before `nightlyIrt` (`cron(15 7 * * ? *)`). The ordering is intentional: up-to-date BKT parameters produce better `p_known` (theta) estimates, which in turn improve the quality of the IRT calibration performed immediately after.
+</Note>
+
+## Execution flow
+
+<Steps>
+  <Step title="Fetch active skills">
+    The handler opens an asyncpg connection pool and runs:
+
+    ```sql
+    SELECT id FROM skills WHERE active = true
+    ```
+
+    This returns every skill that is currently live on the platform.
+  </Step>
+
+  <Step title="Query 30-day attempt history per skill">
+    For each skill, the worker fetches all attempts created in the last 30 days, joined to `items` to filter by `skill_id`:
+
+    ```sql
+    SELECT a.student_id, a.is_correct,
+           EXTRACT(EPOCH FROM a.created_at) AS ts
+    FROM attempts a
+    JOIN items i ON i.id = a.item_id
+    WHERE i.skill_id = $1
+      AND a.created_at > NOW() - INTERVAL '30 days'
+    ORDER BY a.created_at
+    ```
+
+    The timestamp is extracted as a Unix epoch (`float`) so that `AttemptObservation` can sort attempts chronologically per student.
+  </Step>
+
+  <Step title="Skip low-data skills">
+    Skills with fewer than **50 attempts** in the window are skipped — there is not enough signal for a reliable calibration:
+
+    ```python
+    if len(rows) < 50:
+        logger.info("bkt_skip_low_data", skill_id=skill_id, n=len(rows))
+        continue
+    ```
+
+    The structured log event `bkt_skip_low_data` is emitted for every skipped skill, including the actual attempt count.
+  </Step>
+
+  <Step title="Build AttemptObservation list">
+    Each database row is converted to an `AttemptObservation` Pydantic model:
+
+    ```python
+    attempts = [
+        AttemptObservation(
+            student_id=str(r["student_id"]),
+            skill_id=str(skill_id),
+            is_correct=bool(r["is_correct"]),
+            timestamp=float(r["ts"]),
+        )
+        for r in rows
+    ]
+    ```
+  </Step>
+
+  <Step title="Run grid-search calibration">
+    `calibrate_skill(attempts)` performs a brute-force search over all combinations of `(p_l0, p_transit, p_slip, p_guess)` on a grid from `0.05` to `0.95` in steps of `0.05`. Combinations where `p_slip + p_guess >= 1.0` are skipped for identifiability. The combination with the highest total log-likelihood across all students is returned as a `BktParams` object.
+
+    ```python
+    params = calibrate_skill(attempts)
+    ```
+  </Step>
+
+  <Step title="Upsert to skill_bkt_params">
+    The calibrated parameters are written back to Postgres with an `INSERT … ON CONFLICT DO UPDATE` so the table always holds the latest values per skill:
+
+    ```sql
+    INSERT INTO skill_bkt_params
+      (skill_id, p_l0, p_transit, p_slip, p_guess, log_likelihood, calibrated_at)
+    VALUES ($1, $2, $3, $4, $5, $6, NOW())
+    ON CONFLICT (skill_id) DO UPDATE SET
+      p_l0=$2, p_transit=$3, p_slip=$4, p_guess=$5,
+      log_likelihood=$6, calibrated_at=NOW()
+    ```
+  </Step>
+</Steps>
+
+## Return payload
+
+The handler returns a summary dict to EventBridge. Each key in `calibrated_skills` is a `skill_id` string; the value is the full serialised `BktParams`:
+
+```json
+{
+  "calibrated_skills": {
+    "skill-uuid-1": {
+      "p_l0": 0.25,
+      "p_transit": 0.15,
+      "p_slip": 0.10,
+      "p_guess": 0.20,
+      "log_likelihood": -142.38
+    },
+    "skill-uuid-2": { "..." : "..." }
+  },
+  "count": 47
+}
+```
+
+## BktParams schema
+
+<ParamField body="p_l0" type="float" required>
+  Prior probability that a student already knows the skill before any practice. Bounded `[0.0, 1.0]`.
+</ParamField>
+
+<ParamField body="p_transit" type="float" required>
+  Probability that a student transitions from not-knowing to knowing after each practice opportunity. Bounded `[0.0, 1.0]`.
+</ParamField>
+
+<ParamField body="p_slip" type="float" required>
+  Probability that a student answers incorrectly despite knowing the skill. Bounded `[0.0, 0.5]`. The model requires `p_slip + p_guess < 1.0` for identifiability.
+</ParamField>
+
+<ParamField body="p_guess" type="float" required>
+  Probability that a student answers correctly without knowing the skill. Bounded `[0.0, 0.5]`.
+</ParamField>
+
+<ParamField body="log_likelihood" type="float | null">
+  Total log-likelihood of the observed attempt sequences under the fitted parameters. `null` only if no valid grid point was found (degenerate case; defaults are returned instead).
+</ParamField>
+
+<Tip>
+  If `calibrate_skill` finds no valid grid point (all combinations violate the identifiability constraint), it returns the safe defaults: `p_l0=0.3, p_transit=0.1, p_slip=0.1, p_guess=0.2`. This prevents the upsert from storing `null` parameters in production.
+</Tip>
+
+## Local invocation
+
+Because `nightlyBkt` reads no event payload, it can be run end-to-end against a local or staging database with a single command:
+
+```bash
+uv run python -c "from src.pipeline.nightly_bkt import handler; handler({}, None)"
+```
+
+Ensure `DATABASE_URL` is set in your `.env` file pointing at a Postgres instance with `skills`, `items`, `attempts`, and `skill_bkt_params` tables.

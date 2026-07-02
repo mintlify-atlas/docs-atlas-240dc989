@@ -1,0 +1,126 @@
+---
+title: "Environment Variables Reference for Innova AI Engine"
+sidebarTitle: "Environment Variables"
+description: "All environment variables accepted by Innova AI Engine, loaded via pydantic-settings, grouped by concern: API keys, database, AWS, guides pipeline, and alert thresholds."
+---
+
+All configuration in Innova AI Engine is driven entirely by environment variables. At startup, `pydantic-settings` reads the `Settings` class defined in `src/shared/settings.py`, validates every field, and exposes a lazily-initialized singleton via `get_settings()`. A local `.env` file is automatically picked up in development (copy `.env.example` to get started); in production, variables are injected by Serverless Framework from the deploying shell's environment — see `serverless.yml`.
+
+---
+
+## API Keys
+
+These two keys are **required** — the engine will refuse to start if either is missing, because `pydantic-settings` will raise a `ValidationError` with no default to fall back on.
+
+| Variable | Default | Description |
+|---|---|---|
+| `ANTHROPIC_API_KEY` | — *(required)* | API key for the Anthropic Claude platform (Haiku for classification, Sonnet for extraction and solution generation). |
+| `GEMINI_API_KEY` | — *(required)* | Google AI Studio key used by the Gemini vision/PDF workers. |
+| `GEMINI_MODEL` | `gemini-2.5-flash` | Which Gemini model to use for OCR and PDF precheck. Env-overridable so a project whose free-tier quota is exhausted on one model can switch without a code change. Note: `gemini-2.0-flash` was retired 2026-06-01; the default is now `gemini-2.5-flash`. |
+
+---
+
+## Database
+
+| Variable | Default | Description |
+|---|---|---|
+| `DATABASE_URL` | `postgresql://localhost/innova` | asyncpg-compatible Postgres connection string. Local dev typically points at the backend's Docker Compose Postgres on port `5433`. |
+| `MONGODB_URI` | `mongodb://localhost/innova` | MongoDB URI used for telemetry and audit logging; shared with the backend service. |
+
+<Warning>
+  In production, `DATABASE_URL` **must** use the Supabase **session pooler on port 5432**. asyncpg uses prepared statements, which are incompatible with the transaction pooler. Using the transaction pooler URL will cause persistent connection errors at runtime.
+</Warning>
+
+---
+
+## AWS
+
+| Variable | Default | Description |
+|---|---|---|
+| `APP_AWS_REGION` | `us-east-1` | AWS region used by boto3 clients (SQS, S3, SSM). This is deliberately named `APP_AWS_REGION` rather than `AWS_REGION` because `AWS_REGION` is a reserved environment variable inside the Lambda runtime, and asyncpg cannot read it correctly. |
+| `SQS_LLM_CLASSIFY_ARN` | — | ARN of the SQS queue that triggers the `llmClassifier` worker. Owned and exported by the backend Serverless stack. |
+| `SQS_OCR_QUEUE_ARN` | — | ARN of the SQS queue that triggers the `ocrWorker`. Owned and exported by the backend stack. |
+
+<Note>
+  `APP_AWS_REGION` is used instead of `AWS_REGION` because `AWS_REGION` is a reserved environment variable inside the Lambda execution environment and asyncpg is unable to read it reliably.
+</Note>
+
+---
+
+## Runtime Config
+
+| Variable | Default | Description |
+|---|---|---|
+| `OCR_CONFIDENCE_THRESHOLD` | `0.7` | Confidence score below which a Gemini OCR result is escalated to Claude vision for a second pass. |
+| `LLM_BATCH_SIZE` | `20` | Number of unclassified attempts sent to Claude per classify call. Matches the SQS batch size configured in `serverless.yml`. |
+| `LOG_LEVEL` | `info` | structlog / stdlib logging level (`debug`, `info`, `warning`, `error`). |
+
+---
+
+## v9 Guides Pipeline
+
+These variables are used by the three guides-pipeline workers: `guideIngest` (A6), `solutionGenerator` (A7), and `submissionGrader` (A8).
+
+### Queue and Storage
+
+| Variable | Default | Description |
+|---|---|---|
+| `SQS_GUIDE_INGEST_ARN` | — | ARN of the guide-ingest trigger queue. The backend publishes here when a teacher uploads a worksheet PDF. |
+| `SQS_SOLUTION_GEN_ARN` | — | ARN of the solution-generation trigger queue. `guideIngest` publishes here after extraction completes. |
+| `SQS_SOLUTION_GEN_URL` | — | HTTPS URL of the solution-generation queue (used by `guideIngest` to publish messages via `boto3`). |
+| `SQS_SUBMISSION_GRADE_ARN` | — | ARN of the submission-grading trigger queue. The backend publishes here after a student uploads photos. |
+| `SQS_ATTEMPT_REPROCESS_URL` | — | HTTPS URL of the attempt-reprocess queue. `submissionGrader` publishes here so the backend turns grading results into attempts. |
+| `S3_GUIDES_BUCKET` | — | S3 bucket where guide assets (extracted figures, rendered pages) are stored. |
+| `S3_SUBMISSIONS_BUCKET` | — | S3 bucket where student submission photos are stored and read from. |
+
+### Ingest Tuning (`guideIngest`)
+
+| Variable | Default | Description |
+|---|---|---|
+| `GUIDE_INGEST_CHUNK_PAGES` | `20` | Number of PDF pages per extraction chunk sent to Claude. Larger values reduce the number of API calls but increase per-call token cost. |
+| `GUIDE_INGEST_CHUNK_OVERLAP` | `1` | Pages of overlap between consecutive chunks to avoid splitting questions across boundaries. |
+| `GUIDE_MIN_EXTRACTION_QUALITY` | `0.5` | Minimum quality score (0–1) required for a Claude extraction result to be accepted. Results below this threshold are flagged for review. |
+
+### Solution Generation Tuning (`solutionGenerator`)
+
+| Variable | Default | Description |
+|---|---|---|
+| `SOLUTION_GEN_USE_BATCHES` | `true` | Whether the solution generator processes questions in batches rather than one at a time. Reduces latency and call overhead. |
+| `SOLUTION_TOPIC_MIN_CONFIDENCE` | `0.85` | Minimum confidence required when classifying a question's topic during solution generation. Questions below this threshold are handled with fallback logic. |
+
+### Grading Tuning (`submissionGrader`)
+
+| Variable | Default | Description |
+|---|---|---|
+| `GRADING_MIN_TRANSCRIPTION_CONFIDENCE` | `0.5` | Minimum transcription confidence score for a graded submission to proceed. Submissions below this threshold are flagged for human review. |
+
+---
+
+## Kill-Switch SSM Parameters
+
+These variables define the AWS SSM Parameter Store paths for the kill-switches that can pause workers without redeployment. See the [Kill-Switches reference](/configuration/killswitches) for full operational details.
+
+| Variable | Default SSM Path | Description |
+|---|---|---|
+| `SSM_LLM_PAUSED_PARAM` | `/innova/llm/paused` | Pauses the `llmClassifier` worker. |
+| `SSM_OCR_PAUSED_PARAM` | `/innova/ocr/paused` | Pauses the `ocrWorker`. |
+| `SSM_GUIDES_INGEST_PAUSED_PARAM` | `/innova/guides/ingest_paused` | Pauses the `guideIngest` worker. |
+| `SSM_GUIDES_SOLUTION_PAUSED_PARAM` | `/innova/guides/solution_paused` | Pauses the `solutionGenerator` worker. |
+| `SSM_GUIDES_GRADING_PAUSED_PARAM` | `/innova/guides/grading_paused` | Pauses the `submissionGrader` worker. |
+| `SSM_GUIDES_CHEAP_MODE_PARAM` | `/innova/guides/grading_cheap_mode` | Enables cheap mode in `submissionGrader`, downgrading the grading model under cost pressure. |
+
+---
+
+## Alert Thresholds
+
+These thresholds tune the at-risk detection logic inside the `hourlyAlerts` worker (M11 / A9.2), which runs on an EventBridge cron every hour. All values can be tuned in production via environment variables without redeploying code.
+
+| Variable | Default | Description |
+|---|---|---|
+| `ALERT_AT_RISK_PKNOWN_FLOOR` | `0.4` | Minimum `p_known` (BKT mastery probability) below which a student is considered at risk on a topic. |
+| `ALERT_AT_RISK_MIN_TOPICS` | `3` | Minimum number of struggling topics required before an at-risk alert is raised. Prevents noise on students with limited activity. |
+| `ALERT_TOPIC_STRUGGLE_RATIO` | `0.5` | Ratio of recent attempts that must be incorrect for a topic to be flagged as a struggle topic. |
+| `ALERT_STUDENT_DROP_TREND` | `-0.15` | Minimum (negative) change in `p_known` over recent sessions to trigger a declining-trend alert. |
+| `ALERT_UNIT_OFF_TRACK_FLOOR` | `0.4` | Average `p_known` across a unit below which the unit is considered off-track. |
+| `ALERT_GUIDE_COMPLETE_RATIO` | `0.9` | Share of guide questions that must be completed before the guide is considered finished. |
+| `ALERT_GUIDE_COMMON_ERROR_RATIO` | `0.3` | Share of students that must share a common error tag on a question for a common-error alert to fire. |

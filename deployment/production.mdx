@@ -1,0 +1,236 @@
+---
+title: "Production Deployment with Serverless Framework"
+sidebarTitle: "Production"
+description: "Deploy Innova AI Engine to AWS as Lambda container images using Serverless Framework, ECR, and GitHub Actions CI/CD — with deploy order constraints and required secrets."
+---
+
+Production runs on **AWS `us-east-1`** under account `751871643325`. Each of the ten workers ships as an independent **Lambda container image** built from `Dockerfile.lambda`, stored in ECR under the repository `ai-engine-image`, and orchestrated by Serverless Framework v3. Deployments are fully automated via GitHub Actions — merging to `main` triggers a build, ECR push, and `serverless deploy --stage prod` without any manual steps.
+
+<Warning>
+  **Deploy order is mandatory: `innova-backend-serverless` first, then `innova-ai-engine`.**
+
+  The backend Serverless stack is the authoritative owner of all SQS queues, S3 buckets, and SSM parameters that the AI engine consumes. If you deploy the AI engine before the backend, `serverless deploy` will fail with `Cannot resolve variable ... functions.<name>.events.0.sqs.arn` because the ARN environment variables will be empty or missing.
+</Warning>
+
+---
+
+## Build mechanism
+
+### Dockerfile.lambda
+
+`Dockerfile.lambda` extends the official AWS Lambda Python 3.11 base image. All native dependencies are installed with `uv pip install --only-binary :all:` to ensure they are compiled for the Lambda (`amd64`) runtime:
+
+```dockerfile
+FROM public.ecr.aws/lambda/python:3.11
+
+ARG LAMBDA_NAME=llm-classifier
+ENV LAMBDA_NAME=${LAMBDA_NAME}
+
+RUN pip install uv
+
+COPY pyproject.toml uv.lock ./
+RUN uv pip install --system --no-cache --only-binary :all: \
+    anthropic \
+    "google-genai>=1.74.0" \
+    scipy numpy \
+    pydantic "pydantic-settings>=2.0" \
+    structlog asyncpg boto3 httpx \
+    Pillow "pypdfium2>=5.9.0"
+
+COPY src/ ./src/
+
+CMD ["src.pipeline.llm_consumer.handler"]
+```
+
+<Note>
+  `pypdfium2` and `Pillow` contain compiled C extensions. They **must** be installed inside the container image — declaring them only in `pyproject.toml` is not sufficient for Lambda.
+</Note>
+
+### serverless.yml — function map
+
+`serverless.yml` defines **10 functions**, all using the same `ai-engine-image` ECR image with per-function `command` overrides:
+
+| Function | Trigger | Timeout | Memory |
+|---|---|---|---|
+| `health` | HTTP GET `/health` | 10 s | 128 MB |
+| `llmClassifier` | SQS `llm-classify-queue` (batch 20) | 300 s | 512 MB |
+| `ocrWorker` | SQS `ocr-queue` (batch 5) | 60 s | 512 MB |
+| `guideIngest` | SQS `guide-ingest-queue` (batch 1) | 600 s | 2048 MB |
+| `solutionGenerator` | SQS `solution-generation-queue` (batch 1) | 600 s | 1024 MB |
+| `submissionGrader` | SQS `submission-grade-queue` (batch 5) | 120 s | 512 MB |
+| `exerciseGenerator` | SQS `exercise-generate-queue` (batch 1) | 300 s | 512 MB |
+| `nightlyBkt` | EventBridge `cron(0 7 * * ? *)` | 900 s | 1024 MB |
+| `nightlyIrt` | EventBridge `cron(15 7 * * ? *)` | 900 s | 1024 MB |
+| `hourlyAlerts` | EventBridge `cron(0 * * * ? *)` | 900 s | 1024 MB |
+
+All SQS functions use `functionResponseType: ReportBatchItemFailures` so that individual failed records are returned to the queue without blocking successfully processed records.
+
+---
+
+## CI/CD pipeline
+
+### `ci.yml` — runs on every PR and push
+
+The CI workflow runs on pushes to `main`, `feature/**`, `bugfix/**`, and all PRs targeting `main`. It enforces all quality gates before a merge is allowed:
+
+```
+Checkout → Install uv → uv sync --all-extras
+  → ruff check (lint)
+  → ruff format --check (formatting)
+  → pyright src/ (strict type check)
+  → pytest -m "not smoke" --cov=src --cov-fail-under=75
+```
+
+No real API keys are used in CI test runs — `ANTHROPIC_API_KEY` and `GEMINI_API_KEY` are set to `test-key` and all provider calls are mocked.
+
+### `deploy.yml` — runs on merge to `main`
+
+The deploy workflow fires on every push to `main` (and supports `workflow_dispatch` for manual reruns):
+
+```
+Checkout
+  → Configure AWS credentials (OIDC-style via aws-actions/configure-aws-credentials@v5)
+  → Login to Amazon ECR (aws-actions/amazon-ecr-login@v2)
+  → Install uv + serverless@3 + serverless-domain-manager
+  → serverless deploy --stage prod
+```
+
+The `serverless deploy` step resolves all environment variables (API keys, SQS ARNs, S3 buckets) from GitHub Actions secrets and injects them into the Lambda environment block defined in `serverless.yml`.
+
+---
+
+## Required GitHub Actions secrets
+
+Navigate to `https://github.com/vruizz22/innova-ai-engine/settings/secrets/actions` and ensure all of the following secrets are set before the first deploy:
+
+### AWS and infrastructure
+
+| Secret | Description |
+|---|---|
+| `AWS_ACCESS_KEY_ID` | IAM deploy user access key |
+| `AWS_SECRET_ACCESS_KEY` | IAM deploy user secret |
+| `AWS_REGION` | `us-east-1` |
+| `AWS_ACCOUNT_ID` | AWS account ID (used by ECR login) |
+
+### Provider keys and database
+
+| Secret | Description |
+|---|---|
+| `ANTHROPIC_API_KEY` | Claude API key (console.anthropic.com) |
+| `GEMINI_API_KEY` | Google AI Studio key (aistudio.google.com) |
+| `DATABASE_URL` | Supabase **session pooler** URL ending in `:5432` |
+| `MONGODB_URI` | MongoDB Atlas connection string |
+
+<Warning>
+  `DATABASE_URL` must use the Supabase **session pooler on port `:5432`**, not the transaction pooler on `:6543`. The engine uses `asyncpg` with prepared statements, which are incompatible with PgBouncer transaction mode.
+</Warning>
+
+### SQS ARNs and URLs (owned by backend stack)
+
+These values come from the `innova-backend-serverless` CloudFormation outputs. Run `serverless info --verbose --stage prod` in the backend repo, or look them up in the AWS SQS console.
+
+| Secret | Type | Notes |
+|---|---|---|
+| `SQS_LLM_CLASSIFY_ARN` | ARN | Trigger for `llmClassifier` |
+| `SQS_OCR_QUEUE_ARN` | ARN | Trigger for `ocrWorker` |
+| `SQS_GUIDE_INGEST_ARN` | ARN | Trigger for `guideIngest` |
+| `SQS_SOLUTION_GEN_ARN` | ARN | Trigger for `solutionGenerator` |
+| `SQS_SOLUTION_GEN_URL` | URL | Published to by `guideIngest` |
+| `SQS_SUBMISSION_GRADE_ARN` | ARN | Trigger for `submissionGrader` |
+| `SQS_ATTEMPT_REPROCESS_URL` | URL | Published to by `submissionGrader` and `ocrWorker` |
+| `SQS_EXERCISE_GENERATE_ARN` | ARN | Trigger for `exerciseGenerator` |
+
+### S3 buckets (owned by backend stack)
+
+| Secret | Description |
+|---|---|
+| `S3_GUIDES_BUCKET` | Bucket for guide PDFs and extracted figures |
+| `S3_SUBMISSIONS_BUCKET` | Bucket for student submission photos |
+
+---
+
+## Manual deployment commands
+
+You can deploy manually from a local machine with AWS credentials configured:
+
+```bash
+# Deploy all functions to prod
+npx serverless deploy --stage prod
+
+# Deploy a single function (faster — skips image rebuild if unchanged)
+npx serverless deploy function -f nightlyBkt --stage prod
+npx serverless deploy function -f llmClassifier --stage prod
+```
+
+<Tip>
+  Single-function deploys (`deploy function`) skip the ECR image build and are useful for updating environment variables or Lambda configuration without pushing a new image. Use full `serverless deploy` whenever `src/` code or `Dockerfile.lambda` changes.
+</Tip>
+
+---
+
+## Verification
+
+After a successful deploy, confirm the health endpoint responds:
+
+```bash
+curl -s https://ai.superprofes.app/health
+# Expected: 200 OK
+```
+
+For event-driven workers, verify via the AWS console:
+
+- **Lambda**: each function shows runtime *Image* with no configuration errors
+- **SQS**: each queue's *Lambda triggers* tab shows the correct consumer attached
+- **EventBridge**: rules for `nightlyBkt` (07:00 UTC), `nightlyIrt` (07:15 UTC), and `hourlyAlerts` (every hour) exist and are enabled
+- **CloudWatch Logs**: send a test message to a queue and confirm structured JSON logs appear without import or environment errors
+
+---
+
+## IAM permissions
+
+The Lambda execution role is defined inline in `serverless.yml` under `provider.iam.role.statements`:
+
+```yaml
+- Effect: Allow
+  Action:
+    - sqs:ReceiveMessage
+    - sqs:DeleteMessage
+    - sqs:GetQueueAttributes
+    - sqs:SendMessage
+  Resource: "*"
+
+- Effect: Allow
+  Action:
+    - s3:GetObject
+    - s3:PutObject
+  Resource: "*"
+
+- Effect: Allow
+  Action:
+    - ssm:GetParameter
+  Resource:
+    - arn:aws:ssm:us-east-1:*:parameter/innova/*
+```
+
+The Lambda role therefore needs:
+
+- **SQS**: `ReceiveMessage`, `DeleteMessage`, `GetQueueAttributes` (for consuming queues) and `SendMessage` (for publishing to `solution-gen`, `attempt-reprocess`, and `adhoc-solve`)
+- **S3**: `GetObject` and `PutObject` on guides and submissions buckets
+- **SSM**: `GetParameter` scoped to the `/innova/*` parameter path — this is how kill-switch flags (`/innova/llm/paused`, `/innova/guides/ingest_paused`, etc.) are read at runtime without a redeploy
+
+---
+
+## Error catalog
+
+The proprietary error taxonomy — a 2,600+ entry classification tree aligned to the Chilean curriculum — is generated as JSONL files under `out/catalog/`. It is **not auto-deployed** by this repository.
+
+To activate new or deprecated error tags:
+
+1. Regenerate the catalog in this repo
+2. In `innova-backend-serverless`, run `pnpm import:catalog` to load `ErrorTag` rows into Postgres
+3. Run `pnpm codegen:error-tags` to regenerate the rule-engine enums
+4. Redeploy the backend
+
+<Note>
+  The `adhoc_solver` module (`src/adhoc_solver/`) exists in the codebase but is **not wired as a Lambda function** in `serverless.yml`. It is implemented and ready but not yet deployed to production.
+</Note>

@@ -1,0 +1,146 @@
+---
+title: "Testing Strategy: Unit, Property, and Integration Tests"
+sidebarTitle: "Testing"
+description: "How to run the Innova AI Engine test suite: unit tests with mocked providers, property-based BKT/IRT tests with Hypothesis, and SQS/S3 integration tests using moto."
+---
+
+The Innova AI Engine testing strategy is built around a single principle: **pure domain logic is tested deterministically; every external dependency is mocked**. BKT grid search and IRT 2PL MLE are mathematical algorithms with known properties, so they are covered with `hypothesis` property tests that verify parameter recovery. LLM and OCR providers are replaced with fakes that assert the engine sends the correct prompt structure (prompt caching headers, forced `tool_choice`). AWS services (SQS, S3) are emulated in-process with `moto`. Real provider calls are quarantined behind a `smoke` marker and run only on the `main` branch in CI, where API keys are available.
+
+---
+
+## Test categories
+
+<CardGroup cols={2}>
+  <Card title="Unit Tests" icon="flask">
+    BKT/IRT math, LLM classifier (mocked Anthropic provider), guide pipeline components, exercise generator. No I/O; all fast and deterministic.
+  </Card>
+  <Card title="Property Tests" icon="shuffle">
+    BKT calibration with `hypothesis` — generates synthetic attempt histories and verifies that the grid-search recovers the ground-truth parameters within tolerance.
+  </Card>
+  <Card title="Integration Tests" icon="plug">
+    SQS/S3 flows using `moto` — exercises the full handler path including queue polling, S3 uploads, and Postgres writes against in-process AWS mocks.
+  </Card>
+  <Card title="Smoke Tests" icon="fire">
+    Real Anthropic/Gemini API calls. Marked `@pytest.mark.smoke`. Skipped on PRs; run automatically on `main` branch CI only where secrets are available.
+  </Card>
+</CardGroup>
+
+---
+
+## Running tests
+
+```bash
+# Full suite (excludes smoke tests — no real API keys consumed)
+uv run pytest
+
+# With coverage report (gate: ≥75% required)
+uv run pytest --cov=src
+
+# Real provider API calls — main-branch CI only
+uv run pytest -m smoke
+
+# Lint — zero issues required
+uv run ruff check src tests
+
+# Strict type check — zero errors required
+uv run pyright
+```
+
+<Note>
+  The CI workflow (`ci.yml`) runs `pytest tests/ -m "not smoke" --cov=src --cov-fail-under=75 -q` on every push and PR. Coverage below 75% fails the build.
+</Note>
+
+---
+
+## The `smoke` marker
+
+The `smoke` pytest marker is declared in `pyproject.toml`:
+
+```toml
+[tool.pytest.ini_options]
+markers = [
+    "smoke: real API call, runs only on main branch CI",
+]
+```
+
+Any test that makes a real call to Anthropic or Gemini should be decorated with `@pytest.mark.smoke`. These tests are excluded from the default `uv run pytest` run and from PR CI jobs so that developers without keys can run the full suite locally. They execute automatically on merge to `main` via `ci.yml`, which supplies `ANTHROPIC_API_KEY` and `GEMINI_API_KEY` from GitHub Actions secrets.
+
+---
+
+## Coverage gate
+
+The `--cov-fail-under=75` flag in CI enforces a minimum line coverage of **75%** across the `src/` package. Coverage is measured with `pytest-cov`, configured in `pyproject.toml`:
+
+```toml
+[tool.coverage.run]
+source = ["src"]
+omit = ["tests/*"]
+```
+
+The gate applies to the full non-smoke suite. Dropping below 75% blocks the PR from merging.
+
+---
+
+## What the tests cover
+
+| Area | Test approach |
+|---|---|
+| **BKT parameter calibration** | `hypothesis` property tests — generate synthetic attempt histories from known `(p_l0, p_transit, p_slip, p_guess)`, run grid search, assert recovery within ±tolerance |
+| **IRT 2PL calibration** | Unit tests on `scipy.optimize` L-BFGS-B fit; boundary checks on `a ∈ [0.5, 3.0]` and `b ∈ [-3, 3]` |
+| **LLM classifier** | Mocked Anthropic provider; asserts `cache_control` on the system block and forced `tool_choice` in the request; verifies batch-20 grouping by domain |
+| **Guide pipeline (A6–A8)** | End-to-end handler test with moto S3 + mocked Gemini/Anthropic; asserts question extraction, solution key generation, and submission grading each write the correct Postgres rows |
+| **SQS/S3 flows** | `moto`-backed SQS and S3; asserts message acknowledgement (`ReportBatchItemFailures`) and dead-letter semantics on provider error |
+| **OCR worker** | Mocked Gemini response below confidence threshold → asserts escalation to Claude vision |
+
+---
+
+## Type checking with Pyright
+
+Pyright is configured in strict mode in `pyproject.toml`:
+
+```toml
+[tool.pyright]
+pythonVersion = "3.11"
+typeCheckingMode = "strict"
+include = ["src"]
+exclude = ["tests"]
+reportMissingTypeStubs = false
+reportUnknownVariableType = false
+reportUnknownMemberType = false
+reportUnknownArgumentType = false
+```
+
+**Zero errors are required before a PR can merge.** The CI step runs:
+
+```bash
+uv run pyright src/
+```
+
+Strict mode catches missing return types, unbound variables, narrowing issues, and incorrect use of `Optional`. The `reportUnknown*` suppressions are pragmatic exceptions for third-party libraries that ship without stubs (e.g., `asyncpg`, `boto3`).
+
+---
+
+## Lint with Ruff
+
+Ruff is configured in `pyproject.toml` with the following rule sets:
+
+```toml
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "B", "RUF", "T201"]
+```
+
+| Rule set | What it checks |
+|---|---|
+| `E` / `F` | PEP 8 style + pyflakes (unused imports, undefined names) |
+| `I` | Import order (isort-compatible) |
+| `N` | PEP 8 naming conventions |
+| `UP` | `pyupgrade` — modernise syntax to Python 3.11 |
+| `B` | `flake8-bugbear` — likely bugs and design issues |
+| `RUF` | Ruff-native rules |
+| `T201` | Disallows bare `print()` calls in production code |
+
+**Zero issues are required.** The CI step also runs `ruff format --check src/ tests/` to enforce consistent formatting (double quotes, line length 100).
+
+<Warning>
+  The `T201` rule means `print()` statements in `src/` will fail CI. Use `structlog` for all logging in handler and domain code.
+</Warning>

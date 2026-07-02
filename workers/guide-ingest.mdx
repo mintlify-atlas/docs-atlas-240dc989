@@ -1,0 +1,261 @@
+---
+title: "guideIngest: PDF Worksheet Question Extraction Worker"
+sidebarTitle: "Guide Ingest"
+description: "SQS worker that extracts math questions from uploaded worksheet PDFs using Gemini precheck and Claude Sonnet, then publishes each question to the solution-generation queue."
+---
+
+The `guideIngest` worker is the first stage of the v9 guides pipeline. When a teacher uploads a math worksheet PDF, the backend enqueues a message to `guide-ingest-queue`. This worker picks it up and orchestrates a full multi-step extraction pipeline: a cheap Gemini Flash precheck validates the PDF's quality, `pypdfium2` renders pages to images and extracts figure regions, the PDF is sliced into overlapping chunks, and Claude Sonnet runs a forced `extract_guide` tool call per chunk to produce structured questions. All chunks are then merged, deduplicated, figure crops are stored in S3, a `.tex` render is persisted, and each question is published downstream to the `solution-generation-queue` so the `solutionGenerator` worker can build the answer key.
+
+---
+
+## Lambda configuration
+
+<CardGroup cols={2}>
+  <Card title="Handler" icon="code">
+    `src.pipeline.guide_ingest_worker.handler`
+  </Card>
+  <Card title="Trigger" icon="bolt">
+    SQS `guide-ingest-queue` — ARN via `SQS_GUIDE_INGEST_ARN`
+  </Card>
+  <Card title="Batch size" icon="layer-group">
+    **1** — one guide per invocation (heavy multi-call PDF job)
+  </Card>
+  <Card title="Resources" icon="server">
+    Timeout: **600 s** · Memory: **2048 MB**
+  </Card>
+</CardGroup>
+
+<Note>
+  Batch size is intentionally 1. Each guide triggers multiple Gemini and Claude API calls plus in-memory PDF rendering with `pypdfium2`, so a larger batch would risk Lambda timeout and memory exhaustion.
+</Note>
+
+---
+
+## SQS message schema
+
+The backend publishes a `GuideIngestMessage` to `guide-ingest-queue`. The worker deserializes it with Pydantic before starting extraction.
+
+```python
+class GuideIngestMessage(BaseModel):
+    """Inbound SQS body: backend -> `guide-ingest-queue`.
+
+    Mirrors `GuideIngestMessage` in backend `src/shared/sqs/guide-messages.ts`."""
+
+    guide_id: str
+    source_pdf_key: str          # S3 key inside S3_GUIDES_BUCKET
+    course_grade_level: int      # used to tune Sonnet extraction prompts
+    trace_id: str = ""           # propagated through the whole pipeline
+```
+
+<ParamField body="guide_id" type="str" required>
+  UUID of the `Guide` record in Postgres. Used as the primary key for all S3 paths and DB writes.
+</ParamField>
+
+<ParamField body="source_pdf_key" type="str" required>
+  S3 object key pointing to the uploaded worksheet PDF inside `S3_GUIDES_BUCKET`.
+</ParamField>
+
+<ParamField body="course_grade_level" type="int" required>
+  Curriculum grade level of the course the guide belongs to. Passed to the Sonnet extraction prompt to calibrate difficulty expectations.
+</ParamField>
+
+<ParamField body="trace_id" type="str">
+  Optional correlation ID forwarded as an SQS message attribute to the next worker. Bound to the structlog context via `bind_trace_id` for end-to-end log tracing.
+</ParamField>
+
+---
+
+## Extraction pipeline
+
+<Steps>
+  <Step title="Mark guide as EXTRACTING">
+    The repository writes the guide's status to `EXTRACTING` in Postgres before any work begins, preventing duplicate processing if the message is retried.
+  </Step>
+
+  <Step title="Gemini Precheck (GeminiPrecheck)">
+    The full PDF bytes are sent to **Gemini Flash** with a structured JSON prompt. The model returns:
+
+    ```python
+    class PrecheckResult(BaseModel):
+        kind: PdfKind          # "SCANNED" | "DIGITAL" | "MIXED"
+        content_pages: list[int]  # 0-based indices of pages with actual questions
+        quality: float         # legibility score 0.0–1.0
+        notes: str | None      # actionable note when quality is low
+    ```
+
+    If `quality` is below `GUIDE_MIN_EXTRACTION_QUALITY` (default `0.5`), the guide is immediately marked `EXTRACTION_FAILED` in Postgres — no Sonnet tokens are spent. The failure reason is taken from `notes` if present, otherwise defaults to `"PDF quality {score:.2f} below threshold — rescan at 300dpi and re-upload."`.
+
+    <Warning>
+      A guide rejected at precheck is **not retried automatically**. The teacher must re-upload a higher-quality scan. The `notes` field surfaced in the failure reason tells them what went wrong (e.g., `"pages 3–5 blurred"`).
+    </Warning>
+  </Step>
+
+  <Step title="PDF rendering (Pypdfium2Processor)">
+    `Pypdfium2Processor` opens the PDF in memory using `pypdfium2`. It provides three operations used throughout the pipeline:
+
+    - **`page_count(pdf_bytes)`** — returns total page count for chunk range computation.
+    - **`slice_pages(pdf_bytes, start, end)`** — produces a new in-memory PDF containing only the `[start, end)` page range, sent to Sonnet as a `document` content block.
+    - **`crop_figure(pdf_bytes, bbox)`** — renders a single page at `2×` scale (~144 dpi) with `pypdfium2` and crops the bounding box region to a PNG using Pillow.
+  </Step>
+
+  <Step title="Chunking">
+    The PDF is split into overlapping page ranges using `compute_chunk_ranges`:
+
+    ```python
+    def compute_chunk_ranges(
+        total_pages: int, chunk_size: int, overlap: int = 1
+    ) -> list[tuple[int, int]]:
+        ...
+    ```
+
+    | Parameter | Env var | Default |
+    |---|---|---|
+    | `chunk_size` | `GUIDE_INGEST_CHUNK_PAGES` | `20` |
+    | `overlap` | `GUIDE_INGEST_CHUNK_OVERLAP` | `1` |
+
+    The step size is `chunk_size - overlap`, so consecutive chunks share `overlap` pages. This ensures a question straddling a chunk boundary is seen whole in at least one chunk. After extraction, page indices in figure bounding boxes are offset by the chunk's `start` page so they point to absolute positions in the source PDF.
+  </Step>
+
+  <Step title="Sonnet extraction (SonnetExtractor)">
+    For each chunk, `SonnetExtractor` sends the sliced PDF as a native Anthropic `document` content block — not base64 images — together with the grade level and page count. Claude Sonnet 4.6 is forced to call the `extract_guide` tool, returning a structured `ExtractGuideResult`:
+
+    ```python
+    class ExtractedQuestion(BaseModel):
+        label: str | None                         # e.g. "1a", "2b"
+        statement_latex: str                      # full question in LaTeX
+        statement_text: str                       # plain-text version
+        provided_answer: str | None               # answer already on the PDF
+        provided_solution_latex: str | None       # step-by-step if present
+        figure_bboxes: list[FigureBBox]           # normalized [0,1] regions
+        continues_previous: bool = False          # split across chunk boundary
+    ```
+
+    The system prompt is marked `cache_control: ephemeral` so it is prompt-cached across all chunk calls for the same guide, reducing cost and latency. Temperature is fixed at `0.0` for deterministic extraction.
+  </Step>
+
+  <Step title="Merge and deduplication">
+    All per-chunk `ExtractGuideResult` lists are merged by `merge_chunks`. Questions flagged `continues_previous=True` are appended to the last question of the preceding chunk rather than inserted as a new entry, preventing duplicates at chunk boundaries. Each surviving question receives a monotonically increasing `sequence` number starting from 1.
+  </Step>
+
+  <Step title="Figure cropping and S3 upload">
+    For every `FigureBBox` on each merged question, `Pypdfium2Processor.crop_figure` renders and crops the region. The PNG is uploaded to:
+
+    ```
+    guides/{guide_id}/figures/q{sequence}_{index}.png
+    ```
+
+    The S3 key is appended to the question's `figure_keys` list, which is later stored in Postgres alongside the question record.
+  </Step>
+
+  <Step title="LaTeX render and S3 upload">
+    The full list of merged questions is passed to `render_guide_tex`, which produces a `.tex` file. It is uploaded to:
+
+    ```
+    guides/{guide_id}/guide.tex
+    ```
+
+    The `latex_key` is stored in the guide's Postgres record.
+  </Step>
+
+  <Step title="Persist questions to Postgres">
+    `repo.complete(...)` writes all `MergedQuestion` records to the `guide_questions` table and updates the guide row with `source_kind`, `pages`, `latex_key`, `extraction_confidence`, and `extraction_model` (`claude-sonnet-4-6`).
+  </Step>
+
+  <Step title="Publish to solution-generation queue">
+    `SqsPublisher` sends a `SolutionGenMessage` to `SQS_SOLUTION_GEN_URL`, triggering the downstream `solutionGenerator` worker:
+
+    ```python
+    class SolutionGenMessage(BaseModel):
+        guide_id: str
+        guide_question_id: str | None = None   # None = whole guide (default)
+        trace_id: str = ""
+    ```
+
+    The `trace_id` is forwarded as an SQS message attribute so it remains traceable through the next worker.
+  </Step>
+</Steps>
+
+---
+
+## Outcome schema
+
+The handler logs the outcome of every record and returns it in the Lambda response.
+
+```python
+class IngestOutcome(BaseModel):
+    guide_id: str
+    status: str               # "GENERATING_SOLUTIONS" or "EXTRACTION_FAILED"
+    question_count: int = 0   # 0 on failure
+    failure_reason: str | None = None
+```
+
+| `status` | Meaning |
+|---|---|
+| `GENERATING_SOLUTIONS` | Extraction succeeded; questions persisted; downstream message published |
+| `EXTRACTION_FAILED` | Precheck quality below threshold; guide marked failed; no Sonnet call made |
+
+---
+
+## Extraction tuning environment variables
+
+<ParamField body="GUIDE_INGEST_CHUNK_PAGES" type="int" default="20">
+  Maximum number of PDF pages per Sonnet chunk. Larger values reduce the number of API calls but increase token usage per call. Must be positive.
+</ParamField>
+
+<ParamField body="GUIDE_INGEST_CHUNK_OVERLAP" type="int" default="1">
+  Number of pages shared between consecutive chunks. Prevents questions that span a page boundary from being split across two calls. Set to `0` to disable overlap.
+</ParamField>
+
+<ParamField body="GUIDE_MIN_EXTRACTION_QUALITY" type="float" default="0.5">
+  Minimum Gemini precheck quality score (range `0.0`–`1.0`) required to proceed with Sonnet extraction. PDFs scoring below this threshold are rejected immediately and the guide is marked `EXTRACTION_FAILED`. Raise this value to enforce higher-quality uploads; lower it to accept degraded scans.
+</ParamField>
+
+<Tip>
+  For worksheets with many figures, consider reducing `GUIDE_INGEST_CHUNK_PAGES` to keep token counts per chunk manageable and avoid hitting Sonnet's `max_tokens: 8192` limit on a dense page range.
+</Tip>
+
+---
+
+## Error handling and partial batch failure
+
+The worker implements the SQS **`ReportBatchItemFailures`** protocol. Each record is processed independently inside a `try/except` block. On failure, the record's `messageId` is added to `batchItemFailures`, leaving that message in the queue for SQS to retry (subject to the queue's visibility timeout and DLQ configuration). Successfully processed records are **not** retried.
+
+Two distinct failure modes are handled:
+
+| Exception | Behavior |
+|---|---|
+| `PausedError` | SSM killswitch active — record returned to queue silently; no metric emitted |
+| Any other exception | Record returned to queue; `M_EXTRACTION_FAILED` metric emitted via CloudWatch |
+
+```python
+# Partial-batch response shape
+{
+    "processed": int,
+    "batchItemFailures": [{"itemIdentifier": "<messageId>"}, ...]
+}
+```
+
+---
+
+## SSM killswitch
+
+<Warning>
+  Setting the SSM parameter at `SSM_GUIDES_INGEST_PAUSED_PARAM` (default path `/innova/guides/ingest_paused`) to a truthy value pauses this worker **without a redeploy**. All in-flight messages are returned to the queue and retried once the switch is cleared.
+</Warning>
+
+The killswitch is checked twice per guide — once inside `GeminiPrecheck.precheck` and once inside `SonnetExtractor.extract_chunk` — so it takes effect even mid-extraction.
+
+<ParamField body="SSM_GUIDES_INGEST_PAUSED_PARAM" type="string" default="/innova/guides/ingest_paused">
+  SSM Parameter Store path. Set the parameter value to any truthy string to pause the worker.
+</ParamField>
+
+---
+
+## Observability
+
+| Signal | Detail |
+|---|---|
+| `M_EXTRACTION_FAILED` | CloudWatch custom metric; emitted as `Count: 1` on any non-`PausedError` exception |
+| `M_INGEST_COST_USD` | CloudWatch custom metric; emitted on successful extraction with the computed USD cost of all Sonnet tokens used |
+| Structured logs | `guide_precheck_done`, `guide_extract_chunk_done`, `guide_ingested`, `guide_extraction_failed` — all include `guide_id` and `trace_id` |
+| Token / cost accounting | Per-invocation `TokenUsage` is accumulated across all chunks; total input/output/cache tokens and cost in USD are written to the `cost_events` table in Postgres via `repo.save_cost_event` |

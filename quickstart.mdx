@@ -1,47 +1,156 @@
 ---
-title: "Quickstart"
-description: "Begin with a guide on the fastest path to a successful outcome"
+title: "Get Started with Innova AI Engine"
+sidebarTitle: "Quickstart"
+description: "Install dependencies, configure environment variables, run lint and type checks, and invoke your first Lambda worker locally in under 10 minutes."
 ---
 
-Describe how someone begins using your product. What is the first thing they need to do? Are there any prerequisites?
-
-A quickstart should take someone from zero to using your product. They'll get a quick win and a sense of what they can accomplish.
+By the end of this guide you will have a fully configured local environment for Innova AI Engine: all Python dependencies installed in an isolated virtual environment, environment variables validated by `pydantic-settings`, the shared infrastructure running via Docker, lint and type checks passing cleanly, the test suite green, and a local invocation of the nightly BKT calibration worker confirming the whole stack is wired correctly.
 
 ## Prerequisites
 
-Before you begin, you must have:
+Before you begin, make sure the following are available on your machine:
 
-- Requirement one (for example, Node.js 18+, a free account, an API key)
-- Requirement two (for example, a compatible device, a compatible browser, a compatible operating system)
+- **Python 3.11** — the version is pinned in `.python-version`; other versions are not supported.
+- **[uv](https://docs.astral.sh/uv/)** — the project's package manager. Install it with:
+  ```bash
+  curl -LsSf https://astral.sh/uv/install.sh | sh
+  ```
+- **Docker** — needed to run the shared backend infrastructure (Postgres, MongoDB, LocalStack) via `docker compose`.
+- **API keys** — an Anthropic API key and a Google AI Studio (Gemini) key are required for any feature that calls a model. Workers that do not call external providers (e.g. the BKT/IRT cron jobs when the database is seeded) can be exercised without them.
 
-## Get started
+<Warning>
+  Deploy order matters. The SQS queues and S3 buckets that this engine consumes are **created and owned by the `innova-backend-serverless` stack**. Always deploy the backend stack first, then the ai-engine. Attempting to deploy the ai-engine against a fresh AWS account without the backend stack will fail at the trigger ARN resolution step.
+</Warning>
+
+## Setup steps
 
 <Steps>
-  <Step title="Install">
-    Describe how to install your product or sign up.
+  <Step title="Install dependencies">
+    From the repository root, run:
 
     ```bash
-    npm install your-package
+    uv sync --all-extras
     ```
+
+    `uv` reads `pyproject.toml` and `uv.lock`, creates a `.venv` directory automatically, and installs all runtime and development dependencies (including `ruff`, `pyright`, `pytest`, `hypothesis`, and `moto`). No separate `pip install` or `virtualenv` command is needed.
   </Step>
-  <Step title="Configure">
-    Describe any setup or configuration needed before first use.
+
+  <Step title="Configure environment variables">
+    Copy the example file and fill in your credentials:
 
     ```bash
-    your-cli init
+    cp .env.example .env
     ```
+
+    Open `.env` in your editor. The three variables you **must** set to run any worker are:
+
+    | Variable | Description |
+    |----------|-------------|
+    | `ANTHROPIC_API_KEY` | Claude API key — required for LLM classifier, solution generator, grader, exercise generator. |
+    | `GEMINI_API_KEY` | Google AI Studio key — required for OCR worker and guide ingest. |
+    | `DATABASE_URL` | Postgres connection string. For local dev, the backend's `docker compose` exposes Postgres on port `5433`: `postgresql://postgres:innova_secret@localhost:5433/innova_dev_db` |
+
+    Additional variables (SQS ARNs, S3 buckets, MongoDB URI, alert thresholds, SSM parameters) are documented in `.env.example` with inline comments. They are all optional for local testing — workers that need them will fail fast with a clear `pydantic-settings` validation error if they are missing.
+
+    <Note>
+      In production, `DATABASE_URL` must point to the Supabase **session pooler** on port `:5432`. The transaction pooler is incompatible with `asyncpg`'s prepared statements and will cause runtime errors.
+    </Note>
   </Step>
-  <Step title="Run it">
-    Show the first thing a user does to see it working.
+
+  <Step title="Start shared infrastructure">
+    The engine shares a Postgres database and MongoDB instance with the backend. Start them from the backend repository:
 
     ```bash
-    your-cli start
+    # From ../innova-backend-serverless (the sibling backend repo)
+    docker compose up -d
     ```
+
+    This brings up:
+    - **Postgres** on `localhost:5433` — the primary database for all workers.
+    - **MongoDB** on `localhost:27017` — used for telemetry and audit logs.
+    - **LocalStack** — a local AWS emulator for SQS and S3, useful when running integration tests with `moto` fixtures.
+
+    Once the containers are healthy, the `DATABASE_URL` in your `.env` file will be reachable.
+  </Step>
+
+  <Step title="Run lint">
+    The project enforces zero `ruff` issues on all source and test code:
+
+    ```bash
+    uv run ruff check src tests
+    ```
+
+    `ruff` is configured in `pyproject.toml` with rule sets `E`, `F`, `I`, `N`, `UP`, `B`, `RUF`, and `T201` at a line length of 100. All issues must be resolved before opening a pull request — CI enforces this gate.
+  </Step>
+
+  <Step title="Run type checks">
+    The engine runs `pyright` in strict mode with zero errors required:
+
+    ```bash
+    uv run pyright
+    ```
+
+    The `pyright` configuration in `pyproject.toml` targets `src/` only (tests are excluded), uses `typeCheckingMode = "strict"`, and requires Python 3.11. If you see type errors after adding a new adapter or domain function, resolve them before proceeding — the CI deploy workflow blocks on a non-zero `pyright` exit code.
+  </Step>
+
+  <Step title="Run tests">
+    ```bash
+    uv run pytest
+    ```
+
+    The default test run excludes the `smoke` marker, so **no live API keys are needed**. The suite covers:
+
+    - BKT/IRT math correctness (property tests with `hypothesis` and parameter-recovery regression tests).
+    - LLM classifier and graders (providers mocked; assertions on `cache_control` headers and forced `tool_choice`).
+    - SQS/S3 integration flows (`moto` fixtures intercepting `boto3` calls).
+    - Guide pipeline end-to-end (mocked Gemini and Claude adapters).
+
+    To run with coverage (gate is ≥75%):
+
+    ```bash
+    uv run pytest --cov=src
+    ```
+
+    <Note>
+      SQS and S3 workers can also be exercised with `moto` fixtures directly without Docker. See the `tests/` directory for examples of how `@mock_sqs` and `@mock_s3` decorators are used to intercept `boto3` calls in-process.
+    </Note>
+  </Step>
+
+  <Step title="Invoke a worker locally">
+    Lambda handlers are plain Python callables — invoke them directly without SAM or a deployed function:
+
+    ```bash
+    uv run python -c "from src.pipeline.nightly_bkt import handler; handler({}, None)"
+    ```
+
+    The nightly BKT job reads all topics from Postgres, runs grid-search calibration over their attempt history, and writes updated `p_l0`, `p_transit`, `p_slip`, and `p_guess` parameters back to the database. Because it is a cron-triggered handler, it accepts an empty event dict `{}` and a `None` context object — the same signature AWS Lambda uses when invoking it from an EventBridge schedule.
+
+    You can invoke any other cron-based handler the same way:
+
+    ```bash
+    # IRT 2PL calibration
+    uv run python -c "from src.pipeline.nightly_irt import handler; handler({}, None)"
+
+    # Hourly at-risk alerts
+    uv run python -c "from src.pipeline.hourly_alerts import handler; handler({}, None)"
+    ```
+
+    For SQS-triggered workers, construct a minimal SQS event payload matching the shape the backend enqueues and pass it as the first argument. The `tests/` directory contains fixture examples for each worker.
   </Step>
 </Steps>
 
-<Tip>
-  Give people a way to get help. This could be a link to a support page, a chat with a customer support agent, or a forum for your product.
+## Verifying production health
 
-  Example: Need help? Reach out to us at [support@yourcompany.com](mailto:support@yourcompany.com).
-</Tip>
+Once deployed, the `health` Lambda exposes a liveness endpoint:
+
+```bash
+curl -s https://ai.superprofes.app/health
+```
+
+A `200 OK` response confirms the container image is running and the handler is reachable.
+
+## Next steps
+
+- Read the [Architecture](/architecture) page to understand the full SQS event flow and the Clean Architecture layer breakdown.
+- Browse the `src/pipeline/` directory to see how each Lambda handler wires domain logic to adapters.
+- Check the deploy runbook at `../docs/DEPLOY_RUNBOOK.md` for production deployment instructions, required GitHub Actions secrets, and the backend-first deploy constraint.

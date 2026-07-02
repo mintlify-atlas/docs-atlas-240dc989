@@ -1,0 +1,98 @@
+{
+  "projectType": "ai-ml",
+  "projectName": "Innova AI Engine",
+  "projectDescription": "Asynchronous ML/AI workers for the Innova EdTech platform, implementing Bayesian Knowledge Tracing, Item Response Theory calibration, LLM-based error classification, OCR vision pipelines, and document AI — deployed as AWS Lambda container images.",
+  "theme": "luma",
+  "primaryColor": "#4F46E5",
+  "lightColor": "#EEF2FF",
+  "darkColor": "#1E1B4B",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "architecture"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/bkt",
+              "concepts/irt",
+              "concepts/llm-classifier",
+              "concepts/ocr-vision"
+            ]
+          },
+          {
+            "group": "Workers",
+            "pages": [
+              "workers/overview",
+              "workers/nightly-bkt",
+              "workers/nightly-irt",
+              "workers/llm-classifier",
+              "workers/ocr-worker",
+              "workers/guide-ingest",
+              "workers/solution-generator",
+              "workers/submission-grader",
+              "workers/exercise-generator",
+              "workers/hourly-alerts"
+            ]
+          },
+          {
+            "group": "Configuration & Operations",
+            "pages": [
+              "configuration/environment-variables",
+              "configuration/cost-control",
+              "configuration/killswitches"
+            ]
+          },
+          {
+            "group": "Deployment",
+            "pages": [
+              "deployment/local-setup",
+              "deployment/testing",
+              "deployment/production"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Nightly BKT parameter calibration via brute-force grid search (scipy/numpy, no PyTorch)",
+    "Nightly IRT 2PL item calibration with L-BFGS-B MLE (scipy.optimize)",
+    "Batched LLM error classification against a 2,600+ entry procedural error taxonomy (Claude Haiku/Sonnet)",
+    "OCR vision pipeline: Gemini 2.5 Flash primary with Claude vision escalation for low-confidence results",
+    "Guide PDF ingestion: Gemini precheck → Claude Sonnet extraction → pypdfium2 figure rendering",
+    "Student submission grading: multi-photo transcription and scoring via Claude Haiku vision",
+    "Step-by-step solution key generation per extracted guide question (Claude)",
+    "Hourly at-risk student detection (6 alert types: AT_RISK_STUDENT, STUDENT_DROP, UNIT_OFF_TRACK, COMMON_ERROR_IN_TOPIC, GUIDE_GRADING_COMPLETE, GUIDE_COMMON_ERROR)",
+    "SSM kill-switch parameters for cost control without redeployment",
+    "Structured JSON logging with trace IDs and per-call token/cost accounting (structlog)"
+  ],
+  "publicApiSurface": [
+    "src.pipeline.nightly_bkt.handler(event, context)",
+    "src.pipeline.nightly_irt.handler(event, context)",
+    "src.pipeline.llm_consumer.handler(event, context)",
+    "src.pipeline.ocr_worker.handler(event, context)",
+    "src.pipeline.guide_ingest_worker.handler(event, context)",
+    "src.pipeline.solution_generator.handler(event, context)",
+    "src.pipeline.submission_grader.handler(event, context)",
+    "src.pipeline.exercise_generator.handler(event, context)",
+    "src.pipeline.hourly_alerts.handler(event, context)",
+    "src.pipeline.health.handler(event, context)",
+    "src.bkt.calibrate.calibrate_skill(attempts: list[AttemptObservation]) -> BktParams",
+    "src.bkt.update.bkt_update(p_known, p_transit, p_slip, p_guess, is_correct) -> float",
+    "src.irt.two_pl.fit_2pl(item_id, attempts) -> IrtItemParams",
+    "src.irt.fisher.fisher_information(a, b, theta) -> float",
+    "src.ocr.orchestrator.OcrOrchestrator.extract(image_bytes, trace_id) -> OcrResult",
+    "src.observability.cost.cost_usd(usage: TokenUsage, model: str) -> float",
+    "src.shared.killswitch.ensure_not_paused(param_name, *, trace_id) -> None",
+    "src.shared.settings.get_settings() -> Settings"
+  ]
+}

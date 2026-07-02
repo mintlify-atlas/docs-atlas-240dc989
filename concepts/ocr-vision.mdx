@@ -1,0 +1,172 @@
+---
+title: "OCR Vision Pipeline: Handwritten Math Recognition"
+sidebarTitle: "OCR Vision"
+description: "How the engine reads handwritten student math using Gemini 2.5 Flash as primary OCR with automatic escalation to Claude vision when confidence falls below threshold."
+---
+
+Chilean elementary school students do mathematics by hand in paper notebooks. Requiring digital input would lose adoption, so Innova supports a "Subir foto" (upload photo) mode where students photograph their handwritten work and submit it directly. The OCR Vision Pipeline converts those images into structured LaTeX step sequences that the downstream error-classification pipeline can process. To balance cost and accuracy the pipeline uses a **dual-model strategy**: Gemini 2.5 Flash handles all requests first (free tier covers the pilot; ~10× cheaper than Claude at scale per ADR-004), and only escalates to Claude vision when the primary model's confidence score falls below a configurable threshold. The entire strategy is hidden behind the `MathOCRPort` adapter interface, so either backend can be swapped or extended without touching orchestration logic.
+
+## Orchestration Flow
+
+The `OcrOrchestrator` is the single entry point for all image extraction. Its `extract` method implements the dual-model strategy:
+
+```python
+class OcrOrchestrator:
+    def __init__(self) -> None:
+        self._gemini = GeminiAdapter()
+        self._claude = ClaudeAdapter()
+
+    async def extract(self, image_bytes: bytes, trace_id: str = "") -> OcrResult:
+        settings = get_settings()
+        threshold = settings.ocr_confidence_threshold
+
+        primary = await self._gemini.extract(image_bytes, trace_id=trace_id)
+        logger.info(
+            "ocr_primary_result",
+            provider=primary.provider,
+            confidence=primary.overall_confidence,
+            trace_id=trace_id,
+        )
+
+        if primary.overall_confidence >= threshold:
+            return primary
+
+        logger.info(
+            "ocr_escalating_to_claude",
+            confidence=primary.overall_confidence,
+            trace_id=trace_id,
+        )
+        fallback = await self._claude.extract(image_bytes, trace_id=trace_id)
+
+        if fallback.overall_confidence > primary.overall_confidence:
+            return fallback
+        return primary
+```
+
+<Steps>
+  <Step title="Call Gemini (primary)">
+    `GeminiAdapter.extract` sends the image bytes to `gemini-2.5-flash` via the async Google GenAI SDK (`client.aio.models.generate_content`). Gemini returns a JSON payload containing `latex_steps`, `final_answer`, `overall_confidence`, and an optional `topic_hint`.
+  </Step>
+  <Step title="Evaluate confidence">
+    If `primary.overall_confidence ≥ threshold` (default `0.7`, controlled by the `OCR_CONFIDENCE_THRESHOLD` environment variable), the Gemini result is returned immediately. No Claude call is made.
+  </Step>
+  <Step title="Escalate to Claude (fallback)">
+    If Gemini's confidence is below the threshold, `ClaudeAdapter.extract` is called with the same image bytes. Claude receives the image as a base64-encoded JPEG alongside a compact instruction prompt.
+  </Step>
+  <Step title="Return best result">
+    If Claude's `overall_confidence` exceeds Gemini's, the Claude result is returned. Otherwise the original Gemini result is returned — even a low-confidence Gemini result is preferred over a lower-confidence Claude result.
+  </Step>
+</Steps>
+
+<Note>
+  Both `GeminiAdapter` and `ClaudeAdapter` implement the `MathOCRPort` protocol, so the orchestrator handles them identically. If a parse failure occurs (malformed JSON response from either model), the adapter returns an `OcrResult` with an empty `latex_steps` list and `overall_confidence = 0.0` rather than raising an exception.
+</Note>
+
+## The `MathOCRPort` Adapter Interface
+
+The adapter pattern (Clean Architecture port) decouples the orchestration logic from any specific vision model. Adding a new OCR backend (e.g. a self-hosted LaTeX-OCR model) requires only implementing this protocol:
+
+```python
+@runtime_checkable
+class MathOCRPort(Protocol):
+    async def extract(self, image_bytes: bytes, trace_id: str = "") -> OcrResult: ...
+```
+
+Both `GeminiAdapter` and `ClaudeAdapter` satisfy `MathOCRPort` structurally (Python structural subtyping via `runtime_checkable`). The orchestrator instantiates concrete adapters directly, but any conforming implementation can be substituted.
+
+## Model Details
+
+### Gemini 2.5 Flash (Primary)
+
+```python
+OCR_PROMPT = """\
+You are an expert transcriber of Chilean elementary school (grades 3-6) handwritten math.
+Extract the student's step-by-step solution from this image.
+Return a JSON object with fields:
+  - latex_steps: list of strings representing each step
+  - final_answer: string
+  - overall_confidence: number 0-1
+  - topic_hint: string or null (e.g. "subtraction_borrow")
+"""
+```
+
+The Gemini adapter uses the async SDK path (`client.aio.models.generate_content`) with `genai_types.Part.from_bytes` to pass the JPEG image as a multimodal content part alongside the text prompt. The model name is read from the `GEMINI_MODEL` environment variable, defaulting to `gemini-2.5-flash`.
+
+<Warning>
+  `gemini-2.0-flash` was retired on **2026-06-01**. Always use `gemini-2.5-flash` (the current default). Attempting to call the retired model will result in a provider error.
+</Warning>
+
+### Claude Haiku (Fallback)
+
+The Claude adapter uses `claude-haiku-4-5-20251001` with the Anthropic Messages API. The image is base64-encoded and sent as a `{"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", ...}}` content block followed by a text extraction prompt. Claude extracts a JSON fragment by scanning the response text for the outermost `{...}` boundaries.
+
+<Tip>
+  The Claude fallback is only invoked for images that Gemini found ambiguous (confidence &lt; threshold). In a typical school pilot, this represents a small fraction of uploads — messy handwriting, poor lighting, or pages with multiple exercises visible.
+</Tip>
+
+## The `OcrResult` Schema
+
+```python
+class OcrResult(BaseModel):
+    latex_steps: list[str] = Field(default_factory=list)
+    overall_confidence: float = Field(ge=0.0, le=1.0)
+    provider: OcrProvider
+    topic_hint: str | None = None
+    cost_estimated_usd: float = 0.0
+```
+
+<ParamField path="latex_steps" type="list[str]">
+  Ordered list of LaTeX strings representing each step of the student's solution as transcribed from the image. An empty list signals a complete parse failure. These steps are passed directly to the error-classification pipeline as `raw_steps`.
+</ParamField>
+
+<ParamField path="overall_confidence" type="float" required>
+  Model-self-reported confidence that the transcription is accurate, in `[0.0, 1.0]`. This is the value compared against `OCR_CONFIDENCE_THRESHOLD` to decide whether escalation is needed. A value of `0.0` indicates a failed parse.
+</ParamField>
+
+<ParamField path="provider" type="OcrProvider" required>
+  Which model produced this result. One of `"GEMINI"` or `"CLAUDE"`. Stored in the database for observability and cost tracking.
+</ParamField>
+
+<ParamField path="topic_hint" type="str | None">
+  An optional short label (e.g. `"subtraction_borrow"`) that the OCR model inferred from visual context. Can pre-populate the domain routing step in the downstream classifier; not guaranteed to be present or accurate.
+</ParamField>
+
+<ParamField path="cost_estimated_usd" type="float">
+  Estimated USD cost of the API call that produced this result. Set to `0.0` by the Gemini adapter (free tier during pilot) and not yet populated by the Claude adapter. Used by the observability layer for cost accounting.
+</ParamField>
+
+## Confidence Threshold Configuration
+
+The escalation threshold is set via the `OCR_CONFIDENCE_THRESHOLD` environment variable (loaded by `pydantic-settings`):
+
+| Setting | Behaviour |
+|---|---|
+| `OCR_CONFIDENCE_THRESHOLD=0.7` (default) | Escalate to Claude when Gemini confidence &lt; 0.7 |
+| `OCR_CONFIDENCE_THRESHOLD=1.0` | Always escalate (Gemini never returns exactly 1.0 in practice) |
+| `OCR_CONFIDENCE_THRESHOLD=0.0` | Never escalate — always accept Gemini result |
+
+<Info>
+  **Cost context (ADR-004):** During the pilot, Gemini's free tier (15 RPM, 1M TPM) covers all OCR at zero cost. At production scale with 1,000 daily submissions, Gemini costs ~$99/month vs ~$1,000/month for Claude vision — a ~10× difference. The adapter pattern ensures the cost-optimal provider is always primary with the higher-quality provider available as a fallback.
+</Info>
+
+## Output Format Example
+
+A successful extraction from a 4th-grade subtraction problem might return:
+
+```json
+{
+  "latex_steps": [
+    "345 - 178",
+    "\\text{units: } 5 - 8 = 3",
+    "\\text{tens: } 4 - 7 = ?",
+    "\\text{hundreds: } 3 - 1 = 2",
+    "= 233"
+  ],
+  "overall_confidence": 0.82,
+  "provider": "GEMINI",
+  "topic_hint": "subtraction_borrow",
+  "cost_estimated_usd": 0.0
+}
+```
+
+These steps are forwarded to the LLM Classifier (or rule engine) as `raw_steps`. The `topic_hint` may assist domain routing; in this example it correctly identifies the subtraction-with-borrowing domain.

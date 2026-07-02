@@ -1,0 +1,171 @@
+---
+title: "Cost Control and Observability in Innova AI Engine"
+sidebarTitle: "Cost Control"
+description: "How Innova AI Engine tracks and limits LLM inference costs through token accounting, model pricing tables, prompt caching, and SSM-based kill-switches."
+---
+
+LLM inference is the dominant cost in Innova AI Engine. Every call to an Anthropic or Gemini model records token usage and computes a USD cost before writing results to Postgres, so the engineering team can monitor spend at the per-guide, per-submission, and per-worker level. Combined with SSM kill-switches and prompt-caching strategies, the system keeps inference costs predictable and pausable without touching any code.
+
+---
+
+## Token Accounting: `TokenUsage`
+
+All token data flows through a single SDK-agnostic model defined in `src/observability/cost.py`. Adapters map the Anthropic `Usage` object into this type so that domain logic and services never depend on the SDK directly, and the `__add__` operator lets services accumulate per-guide or per-submission totals across multiple API calls.
+
+```python
+class TokenUsage(BaseModel):
+    """SDK-agnostic token tally for one or more LLM calls."""
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_creation_input_tokens: int = 0  # tokens paid to write an ephemeral cache block
+    cache_read_input_tokens: int = 0       # tokens served from cache (discounted)
+
+    def __add__(self, other: TokenUsage) -> TokenUsage:
+        return TokenUsage(
+            input_tokens=self.input_tokens + other.input_tokens,
+            output_tokens=self.output_tokens + other.output_tokens,
+            cache_creation_input_tokens=(
+                self.cache_creation_input_tokens + other.cache_creation_input_tokens
+            ),
+            cache_read_input_tokens=(
+                self.cache_read_input_tokens + other.cache_read_input_tokens
+            ),
+        )
+
+    @property
+    def total_input_tokens(self) -> int:
+        """All input billed: fresh + cache-write (seeding) + cache-read (hits)."""
+        return self.input_tokens + self.cache_creation_input_tokens + self.cache_read_input_tokens
+
+    @property
+    def cache_hit_rate(self) -> float:
+        """Share of input tokens served from cache (0..1); 0 when there is no input."""
+        denom = self.total_input_tokens
+        return self.cache_read_input_tokens / denom if denom else 0.0
+```
+
+<CardGroup cols={2}>
+  <Card title="total_input_tokens" icon="calculator">
+    Sums all three input categories: fresh tokens, cache-write tokens (paid once to seed the block), and cache-read tokens (served at the discounted rate on hits).
+  </Card>
+  <Card title="cache_hit_rate" icon="percent">
+    The fraction of input tokens served from the prompt cache, as a value between 0 and 1. A rate above 0.8 is expected for the LLM classifier after the first call in a batch window.
+  </Card>
+</CardGroup>
+
+---
+
+## Mapping from the Anthropic SDK
+
+The adapter function `usage_from_response` handles the conversion from the Anthropic SDK's `Usage` type (where cache fields are `Optional`) into the always-integer `TokenUsage`:
+
+```python
+def usage_from_response(usage: Usage) -> TokenUsage:
+    """Map an Anthropic `Usage` (cache fields are Optional) into our `TokenUsage`."""
+    return TokenUsage(
+        input_tokens=usage.input_tokens,
+        output_tokens=usage.output_tokens,
+        cache_creation_input_tokens=usage.cache_creation_input_tokens or 0,
+        cache_read_input_tokens=usage.cache_read_input_tokens or 0,
+    )
+```
+
+---
+
+## Model Pricing Table
+
+The `_PRICING` dictionary in `src/observability/cost.py` stores Anthropic list prices for every model this repository calls. Prices are kept in code rather than environment variables so the cost math is reproducible — the table should be updated whenever Anthropic changes its pricing.
+
+| Model | Input ($/1M tok) | Output ($/1M tok) | Cache Write ($/1M tok) | Cache Read ($/1M tok) |
+|---|---|---|---|---|
+| `claude-sonnet-4-6` | $3.00 | $15.00 | $3.75 | $0.30 |
+| `claude-haiku-4-5` | $1.00 | $5.00 | $1.25 | $0.10 |
+
+<Note>
+  Haiku is **15× cheaper** on input tokens than Sonnet. This difference drives the model assignment strategy described below.
+</Note>
+
+---
+
+## Computing Cost: `cost_usd`
+
+```python
+def cost_usd(usage: TokenUsage, model: str) -> float:
+    """Compute the USD cost of `usage` at `model` list prices. Unknown models cost 0.0
+    (the metric degrades gracefully rather than crashing the worker)."""
+    pricing = _PRICING.get(model)
+    if pricing is None:
+        return 0.0
+    return (
+        usage.input_tokens * pricing.input_per_mtok
+        + usage.output_tokens * pricing.output_per_mtok
+        + usage.cache_creation_input_tokens * pricing.cache_write_per_mtok
+        + usage.cache_read_input_tokens * pricing.cache_read_per_mtok
+    ) / _PER_MTOK  # _PER_MTOK = 1_000_000.0
+```
+
+If an unrecognized model string is passed, `cost_usd` returns `0.0` instead of raising an exception. This ensures that a new model being tested in development does not crash the observability layer of the worker that calls it.
+
+---
+
+## Prompt Caching
+
+The LLM classifier (`llmClassifier`) sends Claude a system prompt containing the full 2,600+ error taxonomy on every call. Without caching, that prompt would be billed as fresh input tokens on every invocation.
+
+To avoid this, the system block is decorated with `cache_control: {"type": "ephemeral"}`. Anthropic holds the compiled KV cache for up to five minutes. Subsequent calls within that window pay the discounted `cache_read` rate instead of the full `input` rate.
+
+<CardGroup cols={2}>
+  <Card title="Cache write (first call)" icon="database">
+    The taxonomy prompt (~2,600+ error entries) is compiled and stored. Billed at the cache-write rate: **$3.75/1M tokens** (Sonnet) or **$1.25/1M tokens** (Haiku).
+  </Card>
+  <Card title="Cache hit (subsequent calls)" icon="bolt">
+    The taxonomy is served from cache. Billed at the cache-read rate: **$0.30/1M tokens** (Sonnet) or **$0.10/1M tokens** (Haiku) — roughly **7× cheaper** than a fresh read.
+  </Card>
+</CardGroup>
+
+The `cache_hit_rate` property on `TokenUsage` lets the observability layer emit this ratio as a CloudWatch metric (`M_CACHE_HIT_RATE` in `src/observability/metrics.py`) so cost efficiency of the caching strategy is visible on the dashboard.
+
+---
+
+## Model Assignment Per Worker
+
+Each worker is assigned a model deliberately to balance quality against cost:
+
+| Worker | Model | Rationale |
+|---|---|---|
+| `llmClassifier` | `claude-haiku-4-5` | High-volume batch classification; Haiku is 15× cheaper on input and quality is sufficient for taxonomy matching. |
+| `guideIngest` | `claude-sonnet-4-6` | PDF extraction requires high quality and spatial reasoning; Sonnet handles complex multi-column layouts better. |
+| `solutionGenerator` | `claude-sonnet-4-6` | Step-by-step solution key generation requires detailed mathematical reasoning. |
+| `submissionGrader` | `claude-haiku-4-5` (or cheaper when cheap mode active) | Vision grading against a cached *pauta* (solution key); Haiku vision is sufficient for structured rubric scoring. |
+| `ocrWorker` | Gemini Free tier (`gemini-2.5-flash`) → Claude escalation | Gemini free tier handles the majority of OCR; Claude is only invoked when Gemini confidence falls below `OCR_CONFIDENCE_THRESHOLD`. |
+
+---
+
+## Cheap Mode
+
+The `submissionGrader` worker checks the `SSM_GUIDES_CHEAP_MODE_PARAM` SSM flag (`/innova/guides/grading_cheap_mode`) before each grading call. When cheap mode is active, it downgrades to a less expensive model to reduce per-submission cost under budget pressure.
+
+<Warning>
+  Enabling cheap mode reduces grading model quality. Monitor grading accuracy metrics (tracked under the `Innova/Guides` CloudWatch namespace) before and after enabling this flag to confirm the accuracy trade-off is acceptable for your current workload.
+</Warning>
+
+---
+
+## EMF Metrics
+
+Cost and cache metrics are emitted as [CloudWatch Embedded Metric Format (EMF)](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/CloudWatch_Embedded_Metric_Format_Specification.html) records by logging structured JSON to stdout. No `PutMetricData` call or additional IAM grant is needed — CloudWatch auto-extracts the metrics from Lambda log streams.
+
+The relevant metric names (from `src/observability/metrics.py`) are:
+
+| Metric Name | Unit | Description |
+|---|---|---|
+| `ingest_cost_usd` | None (USD) | Total USD cost for a single guide ingest invocation. |
+| `cost_per_submission` | None (USD) | USD cost for a single submission grading call. |
+| `cache_hit_rate` | None (0–1) | Share of input tokens served from the prompt cache. |
+| `needs_review_ratio` | None (0–1) | Ratio of extractions or submissions flagged for human review. |
+| `extraction_failed_count` | Count | Number of extraction failures in an ingest batch. |
+| `unaligned_rate` | None (0–1) | Rate of attempts with no matching topic classification. |
+| `illegible_rate` | None (0–1) | Rate of submissions flagged as illegible during OCR. |
+
+All metrics are dimensioned by `Stage` (e.g., `prod`, `dev`) so per-environment dashboards stay separated.

@@ -1,0 +1,115 @@
+---
+title: "Lambda Workers: Function Reference Overview"
+sidebarTitle: "Overview"
+description: "All ten Lambda functions in innova-ai-engine: their triggers, SQS batch sizes, timeouts, memory allocations, and the handler entry points."
+---
+
+The `innova-ai-engine` deploys **ten Lambda functions** from a single container image built with `Dockerfile.lambda`. Each function is registered in `serverless.yml` under its own entry point — a Python module inside `src/pipeline/` — but every invocation loads the exact same image. This approach eliminates cold-start image variance between workers and ensures that native dependencies (`pypdfium2`, `pillow`, `scipy`) are identical across the fleet. Functions are triggered by two mechanisms: **SQS event-source mappings** (for processing queues owned by the backend stack) and **EventBridge scheduled rules** (cron expressions, for nightly and hourly background jobs). One function, `health`, is triggered over HTTP through API Gateway and the custom domain `ai.superprofes.app`.
+
+## Function reference table
+
+| Function | Trigger | Queue / Schedule | Batch size | Timeout | Memory | Handler module |
+|---|---|---|---|---|---|---|
+| `health` | HTTP `GET` | `ai.superprofes.app/health` | — | 10 s | 128 MB | `src.pipeline.health` |
+| `llmClassifier` | SQS | `llm-classify-queue` | 20 | 300 s | 512 MB | `src.pipeline.llm_consumer` |
+| `nightlyBkt` | EventBridge | `cron(0 7 * * ? *)` | — | 900 s | 1024 MB | `src.pipeline.nightly_bkt` |
+| `nightlyIrt` | EventBridge | `cron(15 7 * * ? *)` | — | 900 s | 1024 MB | `src.pipeline.nightly_irt` |
+| `hourlyAlerts` | EventBridge | `cron(0 * * * ? *)` | — | 900 s | 1024 MB | `src.pipeline.hourly_alerts` |
+| `ocrWorker` | SQS | `ocr-queue` | 5 | 60 s | 512 MB | `src.pipeline.ocr_worker` |
+| `guideIngest` | SQS | `guide-ingest-queue` | 1 | 600 s | 2048 MB | `src.pipeline.guide_ingest_worker` |
+| `solutionGenerator` | SQS | `solution-generation-queue` | 1 | 600 s | 1024 MB | `src.pipeline.solution_generator` |
+| `submissionGrader` | SQS | `submission-grade-queue` | 5 | 120 s | 512 MB | `src.pipeline.submission_grader` |
+| `exerciseGenerator` | SQS | `SQS_EXERCISE_GENERATE_ARN` | 1 | 300 s | 512 MB | `src.pipeline.exercise_generator` |
+
+<Note>
+  The `llmClassifier`, `ocrWorker`, `submissionGrader`, `guideIngest`, `solutionGenerator`, and `exerciseGenerator` functions all use `functionResponseType: ReportBatchItemFailures`, meaning a failed item is reported individually rather than failing the entire batch.
+</Note>
+
+## Shared container image
+
+All functions reference the same ECR image defined in the `provider.ecr` block of `serverless.yml`:
+
+```yaml
+provider:
+  ecr:
+    images:
+      ai-engine-image:
+        path: ./
+        file: Dockerfile.lambda
+```
+
+Each function overrides the entry command:
+
+```yaml
+functions:
+  nightlyBkt:
+    image:
+      name: ai-engine-image
+      command:
+        - src.pipeline.nightly_bkt.handler
+```
+
+This means a single `docker build` and `docker push` to ECR updates all ten functions simultaneously on `sls deploy`.
+
+## Health endpoint
+
+The `health` function responds to `GET /health` at the custom domain `ai.superprofes.app`. It returns a static JSON body and requires no database access:
+
+```json
+{
+  "status": "ok",
+  "service": "innova-ai-engine"
+}
+```
+
+Verify the deployment at any time with:
+
+```bash
+curl -s https://ai.superprofes.app/health
+```
+
+Expected response: `200 OK` with the payload above.
+
+## Invoking a handler locally
+
+Lambda handlers are plain Python callables that take `(event, context)`. You can invoke any of them directly with `uv run` by passing a simulated event dict and `None` as the context:
+
+```bash
+uv run python -c "from src.pipeline.nightly_bkt import handler; handler({}, None)"
+```
+
+Replace `nightly_bkt` with any other handler module (e.g., `nightly_irt`, `hourly_alerts`). SQS-triggered workers accept a standard SQS event envelope:
+
+```python
+event = {
+    "Records": [
+        {
+            "messageId": "abc123",
+            "body": '{"attempt_id": "..."}',
+            # ...
+        }
+    ]
+}
+```
+
+<Warning>
+  Running handlers locally that interact with Postgres or external APIs requires a valid `.env` file with `DATABASE_URL`, `ANTHROPIC_API_KEY`, and/or `GEMINI_API_KEY` set. See the project README for local setup instructions.
+</Warning>
+
+## Unimplemented worker: `adhoc_solver`
+
+The `src/adhoc_solver/` package (A10) exists in the repository and is fully implemented, but it is **not currently registered as a function in `serverless.yml`**. It is reserved for a future ad-hoc scan-solving feature and will be wired into the deployment when that use case is activated in production.
+
+## Individual worker pages
+
+<CardGroup cols={2}>
+  <Card title="Nightly BKT" icon="calculator" href="/workers/nightly-bkt">
+    EventBridge cron that recalibrates BKT parameters for every active skill nightly at 07:00 UTC.
+  </Card>
+  <Card title="Nightly IRT" icon="chart-line" href="/workers/nightly-irt">
+    EventBridge cron that fits 2PL IRT parameters for every exercise with ≥50 attempts at 07:15 UTC.
+  </Card>
+  <Card title="Hourly Alerts" icon="bell" href="/workers/hourly-alerts">
+    EventBridge cron that detects at-risk students and class-level patterns every hour.
+  </Card>
+</CardGroup>

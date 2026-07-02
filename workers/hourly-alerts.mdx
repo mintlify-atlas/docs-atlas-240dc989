@@ -1,0 +1,243 @@
+---
+title: "hourlyAlerts: At-Risk Student Detection Worker"
+sidebarTitle: "Hourly Alerts"
+description: "EventBridge cron worker that scans mastery and guide-submission data hourly, detecting at-risk students and class-level patterns, then writes deduplicated TeacherAlert rows."
+---
+
+`hourlyAlerts` is the platform's real-time risk-detection layer. It runs every hour, pulling the current state of student mastery and guide-submission grading data, and evaluates six detectors against configurable thresholds. Each detector produces `AlertCandidate` objects that are deduplicated before insertion into the `teacher_alerts` table — so a teacher is never shown the same alert twice in a day for the same entity. The worker covers two families of alerts: mastery-based signals (at-risk students, learning drops, off-track units, and widespread topic struggles) derived from BKT `p_known` values, and guide-based signals (grading completion and common submission errors) derived from the v9 guides pipeline. Running hourly rather than nightly means teachers receive actionable notifications within 60 minutes of the underlying data changing.
+
+## Trigger and configuration
+
+| Property | Value |
+|---|---|
+| Trigger | EventBridge scheduled rule |
+| Schedule | `cron(0 * * * ? *)` — **every hour**, on the hour |
+| Timeout | 900 s |
+| Memory | 1024 MB |
+| Handler | `src.pipeline.hourly_alerts.handler` |
+| Event payload | _(none read — scheduled invocation)_ |
+
+## Return payload
+
+The handler returns a run-level summary:
+
+```json
+{
+  "candidates": 14,
+  "inserted": 3,
+  "by_type": {
+    "AT_RISK_STUDENT": 2,
+    "GUIDE_GRADING_COMPLETE": 1
+  }
+}
+```
+
+- `candidates` — total alerts produced by all detectors before deduplication
+- `inserted` — alerts that were new (not already present) and written to the database
+- `by_type` — breakdown of inserted alerts by `alert_type`
+
+## Alert types
+
+The six detectors are run in sequence inside `run_hourly_alerts`. All operate on data fetched once at the start of the invocation: mastery rows, course sizes, guide progress rows, and guide error rows.
+
+### 1. `AT_RISK_STUDENT`
+
+A student is flagged as at-risk when they have **≥ `ALERT_AT_RISK_MIN_TOPICS` topics** with `p_known < ALERT_AT_RISK_PKNOWN_FLOOR` within a single course.
+
+<Steps>
+  <Step title="Group mastery rows by (course, teacher, student)">
+    All active enrolment rows for the course are grouped per student.
+  </Step>
+  <Step title="Count weak topics">
+    Topics where `p_known < pknown_floor` are counted. If `count < min_topics`, the student is skipped.
+  </Step>
+  <Step title="Emit candidate">
+    Payload includes `weak_topic_count`, the first five `topic_code` values, and `pknown_floor`. Dedup key: `student_id`.
+  </Step>
+</Steps>
+
+**Severity** is computed by `_count_severity(len(weak), min_topics)`:
+- `HIGH` — ≥ `2 × min_topics` weak topics
+- `MED` — ≥ `min_topics` weak topics
+- `LOW` — below threshold (never emitted)
+
+---
+
+### 2. `STUDENT_DROP`
+
+A student is flagged when their **7-day mastery trend** on at least one topic falls at or below `ALERT_STUDENT_DROP_TREND` (a negative value).
+
+<Steps>
+  <Step title="Filter rows with trend data">
+    Only mastery rows where `trend_7d` is not `null` are considered.
+  </Step>
+  <Step title="Find dropped topics per student">
+    Topics where `trend_7d <= drop_threshold` are collected. If none qualify, the student is skipped.
+  </Step>
+  <Step title="Emit candidate for the worst drop">
+    Payload includes `worst_topic_code`, `worst_trend`, and `dropped_topic_count`. Dedup key: `student_id`.
+  </Step>
+</Steps>
+
+**Severity** is computed by `_drop_severity(worst_trend, threshold)`:
+- `HIGH` — `worst_trend <= threshold × 2` (double the configured drop)
+- `MED` — `worst_trend <= threshold`
+- `LOW` — below threshold (never emitted)
+
+---
+
+### 3. `UNIT_OFF_TRACK`
+
+A unit is flagged when the **course-average `p_known`** across all of the unit's topics is below `ALERT_UNIT_OFF_TRACK_FLOOR`.
+
+<Steps>
+  <Step title="Group p_known values by (course, teacher, unit)">
+    All mastery rows are grouped by unit within each course.
+  </Step>
+  <Step title="Compute average p_known">
+    The mean of all `p_known` values in the group is computed. If `avg >= pknown_floor`, the unit is skipped.
+  </Step>
+  <Step title="Emit candidate">
+    Payload includes `unit_id`, `unit_code`, `avg_pknown`, and `sample_size`. Dedup key: `unit_id`.
+  </Step>
+</Steps>
+
+**Severity** is computed by `_deficit_severity(avg, pknown_floor)`:
+- `HIGH` — deficit `>= 0.2` (i.e., `avg <= floor − 0.2`)
+- `MED` — deficit `>= 0.1`
+- `LOW` — smaller deficit
+
+---
+
+### 4. `COMMON_ERROR_IN_TOPIC`
+
+A topic is flagged when the **ratio of students below the mastery floor** in that topic reaches or exceeds `ALERT_TOPIC_STRUGGLE_RATIO`.
+
+<Steps>
+  <Step title="Group by (course, teacher, topic)">
+    All mastery rows are grouped per topic within each course.
+  </Step>
+  <Step title="Compute struggle ratio">
+    `struggling / course_size`, where `struggling` is the count of students with `p_known < pknown_floor`. Skipped if `course_size == 0` or `ratio < course_ratio`.
+  </Step>
+  <Step title="Emit candidate">
+    Payload includes `topic_code`, `struggling_students`, `course_size`, and `ratio`. Dedup key: `topic_id`.
+  </Step>
+</Steps>
+
+**Severity** is computed by `_severity_from_ratio(ratio)`:
+- `HIGH` — ratio ≥ 0.66
+- `MED` — ratio ≥ 0.40
+- `LOW` — ratio below 0.40 (never emitted due to threshold guard)
+
+---
+
+### 5. `GUIDE_GRADING_COMPLETE`
+
+An informational alert is emitted when **≥ `ALERT_GUIDE_COMPLETE_RATIO` of enrolled students** have a graded submission for a published guide.
+
+<Steps>
+  <Step title="For each guide progress row">
+    `graded_students / course_size` is computed. If `ratio < complete_ratio`, the guide is skipped.
+  </Step>
+  <Step title="Emit candidate">
+    Payload includes `guide_id`, `title`, `graded_students`, `course_size`, and `ratio`. Dedup key: `guide_id`.
+  </Step>
+</Steps>
+
+**Severity** is always `LOW` — this is an informational notification, not a warning.
+
+---
+
+### 6. `GUIDE_COMMON_ERROR`
+
+A guide question is flagged when the **same definitive `error_code`** appears for ≥ `ALERT_GUIDE_COMMON_ERROR_RATIO` of enrolled students. Catalog-independent sentinel codes (defined in `SPECIAL_ERROR_TYPES`) are excluded.
+
+<Steps>
+  <Step title="For each guide error row">
+    `n_students / course_size` is computed. Rows where `error_code` is a special sentinel are skipped.
+  </Step>
+  <Step title="Emit candidate">
+    Payload includes `guide_id`, `guide_question_id`, `error_code`, `n_students`, `course_size`, and `ratio`. Dedup key: `{guide_question_id}:{error_code}`.
+  </Step>
+</Steps>
+
+**Severity** uses the same `_severity_from_ratio` as `COMMON_ERROR_IN_TOPIC`.
+
+## AlertCandidate schema
+
+<ParamField body="teacher_id" type="str" required>
+  UUID of the teacher who owns the course. Used to route the alert to the correct dashboard.
+</ParamField>
+
+<ParamField body="course_id" type="str" required>
+  UUID of the course the alert belongs to.
+</ParamField>
+
+<ParamField body="alert_type" type="str" required>
+  One of `AT_RISK_STUDENT`, `STUDENT_DROP`, `UNIT_OFF_TRACK`, `COMMON_ERROR_IN_TOPIC`, `GUIDE_GRADING_COMPLETE`, or `GUIDE_COMMON_ERROR`.
+</ParamField>
+
+<ParamField body="severity" type="str" required>
+  One of `LOW`, `MED`, or `HIGH`. Computed per-detector as described above. Defaults to `MED` if not set.
+</ParamField>
+
+<ParamField body="dedup_ref" type="str" required>
+  Entity identity used for daily deduplication (`(teacher, type, dedup_ref, day)`). Prevents the same alert from being inserted more than once per day for the same entity.
+</ParamField>
+
+<ParamField body="payload" type="dict[str, object]">
+  Heterogeneous JSON written to `teacher_alerts.payload`. Contents are specific to each `alert_type` — see the per-detector descriptions above.
+</ParamField>
+
+<ParamField body="topic_id" type="str | null">
+  Present for topic-level alerts (`COMMON_ERROR_IN_TOPIC`). `null` for all other types.
+</ParamField>
+
+<ParamField body="student_id" type="str | null">
+  Present for student-level alerts (`AT_RISK_STUDENT`, `STUDENT_DROP`). `null` for all other types.
+</ParamField>
+
+## Severity levels
+
+| Level | Meaning |
+|---|---|
+| `LOW` | Informational — no immediate action required (e.g., guide grading complete) |
+| `MED` | Attention warranted — a pattern is developing that a teacher should review |
+| `HIGH` | Urgent — a significant proportion of students or a steep drop requires prompt intervention |
+
+Severity thresholds are computed by four helper functions in `detectors.py`: `_severity_from_ratio`, `_deficit_severity`, `_drop_severity`, and `_count_severity`. Each uses simple linear cut-offs against the configured thresholds.
+
+## Deduplication
+
+Before inserting a candidate, the worker calls `repo.insert_alert_if_absent(candidate)`, which checks whether a `teacher_alerts` row already exists for the same `(teacher_id, alert_type, dedup_ref, day)`. If one does, the insert is skipped and `inserted` is not incremented. This ensures that running the worker 24 times per day does not flood the teacher's dashboard with repeated alerts.
+
+<Warning>
+  `dedup_ref` is entity-scoped, not content-scoped. Changing a student's risk level (e.g., from `MED` to `HIGH`) within the same day will not produce a second alert, since the dedup key (`student_id`) matches the existing row. Re-escalation only appears on the next calendar day.
+</Warning>
+
+## Configurable thresholds
+
+All detection thresholds are read from environment variables via `pydantic-settings` (`src/shared/settings.py`). Override them in `.env` or as Lambda environment variables without redeploying code.
+
+| Environment variable | Default | Description |
+|---|---|---|
+| `ALERT_AT_RISK_PKNOWN_FLOOR` | `0.4` | Mastery floor below which a topic is considered weak. Used by `AT_RISK_STUDENT`, `COMMON_ERROR_IN_TOPIC`, and `UNIT_OFF_TRACK`. |
+| `ALERT_AT_RISK_MIN_TOPICS` | `3` | Minimum number of weak topics a student must have to trigger `AT_RISK_STUDENT`. |
+| `ALERT_TOPIC_STRUGGLE_RATIO` | `0.5` | Minimum fraction of enrolled students below the mastery floor to trigger `COMMON_ERROR_IN_TOPIC`. |
+| `ALERT_STUDENT_DROP_TREND` | `-0.15` | Maximum (most negative) 7-day mastery trend before `STUDENT_DROP` fires. |
+| `ALERT_UNIT_OFF_TRACK_FLOOR` | `0.4` | Course-average mastery floor below which `UNIT_OFF_TRACK` fires for a unit. |
+| `ALERT_GUIDE_COMPLETE_RATIO` | `0.9` | Minimum fraction of enrolled students with graded submissions to trigger `GUIDE_GRADING_COMPLETE`. |
+| `ALERT_GUIDE_COMMON_ERROR_RATIO` | `0.3` | Minimum fraction of enrolled students sharing the same error code to trigger `GUIDE_COMMON_ERROR`. |
+
+<Tip>
+  Lowering `ALERT_AT_RISK_PKNOWN_FLOOR` or `ALERT_AT_RISK_MIN_TOPICS` will increase alert volume significantly on large cohorts. Tune these values against your false-positive tolerance before changing them in production.
+</Tip>
+
+## Local invocation
+
+```bash
+uv run python -c "from src.pipeline.hourly_alerts import handler; handler({}, None)"
+```
+
+Ensure `DATABASE_URL` is set in your `.env` file. The function requires `student_skill_mastery`, `enrollments`, `items`, `skills`, `teacher_alerts`, and the guide-related tables to be accessible.

@@ -1,20 +1,74 @@
 ---
-title: "Introduction"
-description: "Welcome to your project"
+title: "Innova AI Engine: ML Workers for EdTech"
+sidebarTitle: "Home"
+description: "Async BKT/IRT/LLM/OCR workers for the Innova EdTech platform. Deployed as AWS Lambda container images — no PyTorch, just deterministic math and hosted LLMs."
 ---
 
-Write a short description of your product here. What it does, who it's for, and what they can accomplish with it.
+Innova AI Engine is the asynchronous AI layer powering SuperProfe. It consumes events from AWS SQS, runs knowledge-tracing calibration, error classification, OCR, guide ingestion, and student-submission grading, then writes results back to Postgres — all without a monolithic server.
 
-<Tip>
-  Ready to make this your own? Start by editing this page. Update your `docs.json` file to customize your site. Then fill out the [Quickstart](/quickstart) page.
-</Tip>
+<CardGroup cols={2}>
+  <Card title="Introduction" icon="book-open" href="/introduction">
+    Understand what the engine does, how it fits into the SuperProfe platform, and which problems each worker solves.
+  </Card>
+  <Card title="Quickstart" icon="bolt" href="/quickstart">
+    Install dependencies, configure environment variables, and run your first worker locally in minutes.
+  </Card>
+  <Card title="Architecture" icon="diagram-project" href="/architecture">
+    Full pipeline diagram, Clean Architecture breakdown, and deploy-order constraints between the backend and engine stacks.
+  </Card>
+  <Card title="Workers" icon="gears" href="/workers/overview">
+    Reference for all ten Lambda functions: triggers, timeouts, memory, and payload schemas.
+  </Card>
+</CardGroup>
 
-<Card title="Quickstart" icon="rocket" href="/quickstart">
-  This card links to the quickstart page in your project.
-</Card>
-<Card title="Components" icon="puzzle-piece" href="https://mintlify.com/docs/components">
-  Add cards, callouts, steps, tabs, and more to design and structure your pages.
-</Card>
-<Card title="Settings" icon="gear" href="https://mintlify.com/docs/organize/settings">
-  Set your site name, branding, and navigation in the `docs.json` file.
-</Card>
+## Core capabilities
+
+<CardGroup cols={2}>
+  <Card title="BKT Calibration" icon="chart-line" href="/concepts/bkt">
+    Nightly Bayesian Knowledge Tracing parameter fitting via brute-force grid search over 4 skill parameters.
+  </Card>
+  <Card title="IRT 2PL Fitting" icon="function" href="/concepts/irt">
+    Item Response Theory calibration with L-BFGS-B MLE — discrimination and difficulty per exercise, no GPU needed.
+  </Card>
+  <Card title="LLM Error Classifier" icon="brain" href="/concepts/llm-classifier">
+    Batched Claude Haiku classification against a 2,600+ entry procedural error taxonomy with prompt caching.
+  </Card>
+  <Card title="OCR Vision Pipeline" icon="eye" href="/concepts/ocr-vision">
+    Gemini 2.5 Flash primary OCR with automatic Claude vision escalation when confidence falls below threshold.
+  </Card>
+</CardGroup>
+
+## Get started
+
+<Steps>
+  <Step title="Install dependencies">
+    Use `uv` to create the virtualenv and install all packages, including dev extras:
+    ```bash
+    uv sync --all-extras
+    ```
+  </Step>
+  <Step title="Configure environment">
+    Copy the example env file and fill in your API keys and database URL:
+    ```bash
+    cp .env.example .env
+    # Set ANTHROPIC_API_KEY, GEMINI_API_KEY, DATABASE_URL
+    ```
+  </Step>
+  <Step title="Start shared infrastructure">
+    The engine shares Postgres, MongoDB, and LocalStack with the backend. Start them from the backend repo:
+    ```bash
+    # In ../innova-backend-serverless:
+    docker compose up -d
+    ```
+  </Step>
+  <Step title="Run a worker locally">
+    Invoke any handler directly with a simulated event — no Lambda runtime needed:
+    ```bash
+    uv run python -c "from src.pipeline.nightly_bkt import handler; handler({}, None)"
+    ```
+  </Step>
+</Steps>
+
+<Note>
+  The engine must be deployed **after** the backend stack (`innova-backend-serverless`). SQS queues, S3 buckets, and SSM parameters are all created by the backend stack and referenced by ARN in `serverless.yml`.
+</Note>

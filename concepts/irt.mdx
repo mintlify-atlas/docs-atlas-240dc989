@@ -1,0 +1,168 @@
+---
+title: "Item Response Theory: Exercise Difficulty Calibration"
+sidebarTitle: "IRT"
+description: "How the 2PL IRT model fits discrimination and difficulty parameters for each exercise nightly using L-BFGS-B maximum likelihood estimation."
+---
+
+Item Response Theory (IRT), formalised by Lord (1980), treats the probability that a student answers an exercise correctly as a function of both the student's latent ability (θ) and the item's intrinsic properties. Innova uses the **Two-Parameter Logistic (2PL)** model, which characterises each exercise by two parameters: its *discrimination* (`a`) and its *difficulty* (`b`). Every night the `nightlyIrt` Lambda (cron `0 7 15 * * ? *`) queries the database for every exercise that has accumulated at least 50 attempts, fits `a` and `b` via maximum likelihood using L-BFGS-B, and writes the results back to Postgres. The backend then uses those parameters together with Fisher Information to select the most informative next item for each student's current ability level.
+
+## The 2PL Model
+
+The 2PL model predicts the probability of a correct response for a student with ability θ as:
+
+```
+P(correct | θ) = 1 / (1 + exp(−a × (θ − b)))
+```
+
+This is a logistic (sigmoid) function whose shape is determined by the two item parameters:
+
+<CardGroup cols={2}>
+  <Card title="a — Discrimination" icon="sliders">
+    Controls how steeply the probability curve rises around the difficulty point. Higher `a` means the item reliably separates students above and below its difficulty level. Constrained to `[0.5, 3.0]`. A well-designed exercise typically has `a ∈ [0.8, 2.0]`.
+  </Card>
+  <Card title="b — Difficulty" icon="chart-line">
+    The ability level θ at which a student has a 50 % probability of answering correctly. Constrained to `[−3, 3]` in standard deviation units relative to the student population. `b = 0` is average difficulty; `b = 2` is hard; `b = −2` is easy.
+  </Card>
+</CardGroup>
+
+<Info>
+  θ (student ability) is maintained and updated by the backend separately from this engine. The AI engine receives `(theta, is_correct)` pairs as input; it does not compute or store θ directly.
+</Info>
+
+## Fisher Information
+
+Fisher Information quantifies how much information an item provides about a student's ability at a specific θ value. The `nightlyIrt` calibration exposes `fisher_information` so the backend can use it for adaptive item selection:
+
+```python
+def fisher_information(a: float, b: float, theta: float) -> float:
+    """Fisher information I(theta) = a^2 * P(theta) * (1 - P(theta))."""
+    p = 1.0 / (1.0 + np.exp(-a * (theta - b)))
+    return float(a**2 * p * (1.0 - p))
+```
+
+The formula `I(θ) = a² · P(θ) · (1 − P(θ))` is maximised when `P(θ) = 0.5`, i.e., when the item difficulty matches the student's ability exactly. This is the principle behind adaptive testing: always present the item that reduces uncertainty about the student's true θ the most.
+
+The companion `pick_best_item` utility selects the highest-information item from a candidate pool:
+
+```python
+def pick_best_item(
+    student_theta: float,
+    candidates: list[tuple[str, float, float]],
+) -> str:
+    """Return item_id with maximum Fisher information for given theta."""
+    best_id = candidates[0][0]
+    best_info = -1.0
+    for item_id, a, b in candidates:
+        info = fisher_information(a, b, student_theta)
+        if info > best_info:
+            best_info = info
+            best_id = item_id
+    return best_id
+```
+
+## Nightly Calibration: L-BFGS-B MLE
+
+Unlike BKT's four-dimensional grid search, IRT calibration is a continuous optimisation problem. Innova uses **L-BFGS-B** (Limited-memory BFGS with Bounds), a quasi-Newton method well-suited to bounded continuous optimisation with moderate dimensionality.
+
+<Steps>
+  <Step title="Minimum attempts gate">
+    If the exercise has fewer than `MIN_ATTEMPTS = 50` recorded attempts, the function returns default parameters `a=1.0, b=0.0` with `calibrated=False`. These defaults place the item at average difficulty and average discrimination until enough data exists.
+  </Step>
+  <Step title="Prepare data">
+    Extract the array of student abilities `thetas` and binary outcomes `correct` from the `list[tuple[float, bool]]` input. Both are converted to `numpy` float arrays for vectorised computation.
+  </Step>
+  <Step title="Define negative log-likelihood">
+    Construct the objective function. For each `(theta_i, correct_i)` pair, the 2PL probability `P_i` is computed, clipped to `[1e-9, 1-1e-9]` for numerical stability, and the Bernoulli log-likelihood `correct_i·log(P_i) + (1-correct_i)·log(1-P_i)` is accumulated.
+  </Step>
+  <Step title="Optimise with L-BFGS-B">
+    Run `scipy.optimize.minimize` with bounds `a ∈ [0.5, 3.0]` and `b ∈ [−3, 3]`, initialised at `x0 = [1.0, 0.0]`. The optimiser returns the fitted `(a, b)` pair.
+  </Step>
+  <Step title="Return IrtItemParams">
+    Wrap the fitted parameters in an `IrtItemParams` with `calibrated=True` and write it back to the `irt_item_params` table.
+  </Step>
+</Steps>
+
+### The `fit_2pl` Function
+
+```python
+MIN_ATTEMPTS = 50
+
+def fit_2pl(
+    item_id: str,
+    attempts: list[tuple[float, bool]],
+) -> IrtItemParams:
+    """
+    Fit 2PL IRT model via L-BFGS-B maximum likelihood.
+    attempts: list of (theta_student, is_correct).
+    Returns default params (a=1.0, b=0.0) if < MIN_ATTEMPTS.
+    """
+    if len(attempts) < MIN_ATTEMPTS:
+        return IrtItemParams(item_id=item_id, a=1.0, b=0.0, calibrated=False)
+
+    thetas = np.array([t for t, _ in attempts], dtype=float)
+    correct = np.array([1.0 if c else 0.0 for _, c in attempts], dtype=float)
+
+    def neg_log_likelihood(params: np.ndarray) -> float:
+        a, b = params
+        p = 1.0 / (1.0 + np.exp(-a * (thetas - b)))
+        p = np.clip(p, 1e-9, 1.0 - 1e-9)
+        return -float(np.sum(correct * np.log(p) + (1.0 - correct) * np.log(1.0 - p)))
+
+    result = minimize(
+        neg_log_likelihood,
+        x0=np.array([1.0, 0.0]),
+        method="L-BFGS-B",
+        bounds=[(0.5, 3.0), (-3.0, 3.0)],
+    )
+
+    a_fit, b_fit = float(result.x[0]), float(result.x[1])
+    return IrtItemParams(item_id=item_id, a=a_fit, b=b_fit, calibrated=True)
+```
+
+<Tip>
+  The L-BFGS-B bounds are tight enough to prevent degenerate solutions (e.g. `a → 0` making the item useless, or `|b| → ∞` making it impossible or trivial for all students) while remaining wide enough to capture genuinely extreme items in the curriculum.
+</Tip>
+
+## The `IrtItemParams` Schema
+
+```python
+class IrtItemParams(BaseModel):
+    item_id: str
+    a: float = Field(default=1.0, ge=0.1, le=3.0, description="Discrimination parameter")
+    b: float = Field(default=0.0, ge=-3.0, le=3.0, description="Difficulty parameter")
+    calibrated: bool = False
+```
+
+<ParamField path="item_id" type="str" required>
+  The unique identifier of the exercise (maps to the `exercises` table primary key in the backend). Passed through from the input and used as the Postgres upsert key.
+</ParamField>
+
+<ParamField path="a" type="float">
+  Discrimination parameter. Default `1.0` (average discrimination). Bounded `[0.1, 3.0]` at the schema level. Values below `0.5` are never produced by calibration (the L-BFGS-B lower bound for `a` is `0.5`); the schema is slightly more permissive to allow manual overrides.
+</ParamField>
+
+<ParamField path="b" type="float">
+  Difficulty parameter in logit (standard deviation) units. Default `0.0` (average difficulty). Bounded `[−3.0, 3.0]`.
+</ParamField>
+
+<ParamField path="calibrated" type="bool">
+  `True` when parameters were fit from real data via L-BFGS-B; `False` when the exercise had fewer than `MIN_ATTEMPTS = 50` attempts and the defaults `a=1.0, b=0.0` were returned instead. The backend can use this flag to filter out uncalibrated items from adaptive selection.
+</ParamField>
+
+## Parameter Interpretation Guide
+
+| `b` value | Interpretation | Typical context |
+|---|---|---|
+| `b ≤ −2.0` | Very easy — most students answer correctly | Warm-up or review items |
+| `b ∈ [−1, 1]` | Near-average difficulty | Core curriculum items |
+| `b ≥ 2.0` | Very hard — most students answer incorrectly | Challenge or extension items |
+
+| `a` value | Interpretation |
+|---|---|
+| `a < 0.8` | Low discrimination — item doesn't reliably distinguish ability levels |
+| `a ∈ [0.8, 2.0]` | Typical well-designed item |
+| `a > 2.0` | High discrimination — sharp boundary around the difficulty point |
+
+<Warning>
+  Items with `calibrated=False` use the neutral defaults `a=1.0, b=0.0`. The backend should treat these as unranked placeholders in adaptive item selection until they accumulate sufficient response data.
+</Warning>

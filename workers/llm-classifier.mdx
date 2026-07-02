@@ -1,0 +1,180 @@
+---
+title: "llmClassifier: Async Error Classification Worker"
+sidebarTitle: "LLM Classifier"
+description: "SQS worker that classifies unclassified student attempts against a 2,600+ error taxonomy using Claude Haiku in batches of 20 with prompt caching and forced tool_use."
+---
+
+The `llmClassifier` worker is the core error-intelligence pipeline of Innova. It consumes `UNCLASSIFIED` student attempt records from the `llm-classify-queue`, groups them by academic domain, and routes each group to Claude Haiku (claude-haiku-4-5-20251001) for classification against a proprietary 2,600+ error taxonomy aligned to the Chilean K-12 curriculum. Results are written back to the `attempts` table in Postgres with a classifier source, confidence score, and resolved `error_tag_id`. Attempts the model still cannot classify trigger a second-pass suggestion flow that proposes and persists new `error_tag` entries, growing the catalog organically.
+
+## Trigger & configuration
+
+<CardGroup cols={2}>
+  <Card title="Queue" icon="list-check">
+    SQS `llm-classify-queue`  
+    ARN from env `SQS_LLM_CLASSIFY_ARN`
+  </Card>
+  <Card title="Lambda settings" icon="bolt">
+    Timeout: **300 s** · Memory: **512 MB**  
+    Handler: `src.pipeline.llm_consumer.handler`
+  </Card>
+</CardGroup>
+
+| Setting | Value |
+|---|---|
+| `batchSize` | `20` |
+| `maximumBatchingWindow` | `60 s` |
+| `functionResponseType` | `ReportBatchItemFailures` |
+
+## SQS message body — `Attempt`
+
+Each record body is a JSON-serialised `Attempt` object (validated via Pydantic `model_validate_json`).
+
+```json
+{
+  "id": "uuid-of-the-attempt",
+  "student_id": "uuid-of-the-student",
+  "domain_id": "uuid-of-the-domain-or-null",
+  "subdomain_code": "ALG-LINEAR-EQ",
+  "topic": "linear_equations",
+  "problem_statement": "Solve for x: 2x + 3 = 7",
+  "canonical_solution": "x = 2",
+  "raw_steps": ["2x = 7 - 3", "2x = 4", "x = 2"],
+  "final_answer": "x = 3"
+}
+```
+
+<ParamField body="id" type="string" required>
+  UUID of the student attempt — used as the primary key when writing classification results back to Postgres.
+</ParamField>
+
+<ParamField body="student_id" type="string">
+  UUID of the student. Included for logging context; no PII is forwarded to Claude.
+</ParamField>
+
+<ParamField body="domain_id" type="string | null">
+  UUID of the academic domain. When present, the worker fetches the domain-specific catalog and uses the v8 by-domain prompt. `null` falls back to the generic v7 classifier.
+</ParamField>
+
+<ParamField body="subdomain_code" type="string | null">
+  Subdomain code (e.g. `ALG-LINEAR-EQ`). Used as the fallback label when `topic` is `null` (post-taxonomy migration).
+</ParamField>
+
+<ParamField body="topic" type="string | null">
+  Teacher-confirmed topic code. Optional — only present when the teacher has pinned the question to a Topic.
+</ParamField>
+
+<ParamField body="problem_statement" type="string" required>
+  The problem text shown to the student.
+</ParamField>
+
+<ParamField body="canonical_solution" type="string" required>
+  The correct reference solution used as context for the classifier.
+</ParamField>
+
+<ParamField body="raw_steps" type="array" required>
+  The student's work steps as recorded by the backend.
+</ParamField>
+
+<ParamField body="final_answer" type="string" required>
+  The student's final submitted answer.
+</ParamField>
+
+## Two-pass classification flow
+
+<Steps>
+  <Step title="Domain grouping">
+    `_group_by_domain` partitions the incoming batch by `domain_id`. A single SQS batch of 20 can contain attempts from multiple domains; each group is classified independently so the domain-specific catalog and prompt are applied correctly (ADR A4.3).
+  </Step>
+  <Step title="First-pass classification (v8 / v7)">
+    For each domain group:
+    - If `domain_id` is present **and** an ACTIVE catalog exists in Postgres → `classify_batch_for_domain` is called with the domain-specialised system prompt and a tool whose enum is restricted to that domain's error codes.
+    - If `domain_id` is absent or no catalog is found → `classify_batch` is called with the generic v7 prompt covering the full 2,600+ taxonomy.
+
+    Both paths use `claude-haiku-4-5-20251001` with `cache_control: ephemeral` on the system block and `tool_choice: {"type": "tool", "name": "classify_errors"}` to force structured output.
+  </Step>
+  <Step title="Write results to Postgres">
+    Results are written to the `attempts` table in a single transaction using `_UPDATE_SQL`:
+
+    ```sql
+    UPDATE attempts
+       SET error_tag_id = (
+               SELECT id FROM error_tags
+                WHERE code = $1
+                  AND status = 'ACTIVE'
+                  AND code NOT IN ('CORRECT', 'UNCLASSIFIED', 'TRANSVERSAL_LIKELY')
+           ),
+           classifier_source = 'LLM',
+           confidence = $2,
+           classified_at = NOW(),
+           status = CASE
+               WHEN $1 IN ('CORRECT', 'UNCLASSIFIED', 'TRANSVERSAL_LIKELY')
+                    AND $1 <> 'CORRECT' THEN 'PENDING'
+               ELSE 'CLASSIFIED'
+           END
+     WHERE id = $3
+    ```
+
+    The `SPECIAL_TYPES` sentinel (`CORRECT`, `UNCLASSIFIED`, `TRANSVERSAL_LIKELY`) are **never** resolved to a catalog FK — even if a seed `error_tag` with that code exists — because the status filter on `ACTIVE` alone is not sufficient. `UNCLASSIFIED` and `TRANSVERSAL_LIKELY` remain `PENDING`; everything else (including `CORRECT` with a NULL tag) becomes `CLASSIFIED`.
+  </Step>
+  <Step title="Second-pass: suggest new error types">
+    After the first pass, attempts whose `error_type` is still `UNCLASSIFIED` are collected. `suggest_new_error_types` proposes new `error_tag` entries for them. Unique codes are upserted into `error_tags` (`source = 'LLM_GENERATED'`, `status = 'ACTIVE'`), and then `_UPDATE_SQL` is re-run — the subquery now resolves because the tag was just inserted. The catalog cache is cleared after the upsert so subsequent invocations pick up the new entries.
+
+    <Note>
+      Second-pass failures are logged and swallowed — the primary classification is already persisted. Auto-suggest is a best-effort catalog growth mechanism.
+    </Note>
+  </Step>
+</Steps>
+
+## `AttemptClassification` output schema
+
+```python
+class AttemptClassification(BaseModel):
+    attempt_id: str
+    error_type: str       # error_tag.code, or one of CORRECT / UNCLASSIFIED / TRANSVERSAL_LIKELY
+    evidence: str         # free-text reasoning from the model
+    confidence: float     # 0.0 – 1.0
+```
+
+<ParamField body="attempt_id" type="string">
+  Echoed from the input — used to correlate results back to their `attempts` row.
+</ParamField>
+
+<ParamField body="error_type" type="string">
+  The classified error code. Matches `error_tags.code` for real errors, or one of the sentinel values `CORRECT`, `UNCLASSIFIED`, or `TRANSVERSAL_LIKELY`.
+</ParamField>
+
+<ParamField body="evidence" type="string">
+  Model-provided reasoning for the classification. Stored for auditability.
+</ParamField>
+
+<ParamField body="confidence" type="float">
+  Model confidence in the classification, in the range `[0.0, 1.0]`.
+</ParamField>
+
+## Trace ID propagation
+
+The trace ID is read from the **SQS message attributes** of the first record in the batch:
+
+```python
+attrs = record.get("messageAttributes")
+trace = attrs.get("trace_id")
+# -> trace["stringValue"]
+```
+
+The extracted value is bound to the structlog context via `bind_trace_id(trace_id)` so every log line emitted during the invocation carries the same trace ID.
+
+## Partial batch failure handling
+
+The function is configured with `functionResponseType: ReportBatchItemFailures`. If an unhandled exception is raised during the processing of a domain group, the exception propagates out of `_main` and Lambda retries the **entire batch**. Per the current implementation, failures are scoped at the domain-group level: a single failing group causes a full re-delivery, so batches are intentionally kept small (max 20) to limit blast radius.
+
+<Warning>
+  A domain-group exception re-queues the entire 20-message batch. If a single attempt is consistently causing Claude to error, it will block the full batch until it expires to the DLQ.
+</Warning>
+
+## Cost killswitch
+
+Before calling Claude, the client reads the SSM parameter named by `SSM_LLM_PAUSED_PARAM` (default `/innova/llm/paused`). If the value is the string `"true"`, a `PausedError` is raised immediately and no model call is made. This allows production to pause LLM inference without a redeploy.
+
+<Tip>
+  Toggle the killswitch via AWS SSM Parameter Store: set `/innova/llm/paused` to `"true"` to halt all LLM classification, or `"false"` to resume. The change takes effect on the next Lambda invocation.
+</Tip>

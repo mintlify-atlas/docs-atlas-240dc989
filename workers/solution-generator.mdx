@@ -1,0 +1,307 @@
+---
+title: "solutionGenerator: Step-by-Step Answer Key Builder"
+sidebarTitle: "Solution Generator"
+description: "SQS worker that builds a complete step-by-step solution key for each extracted guide question using Claude Sonnet, setting the guide to REVIEW status when done."
+---
+
+The `solutionGenerator` worker is the second stage of the v9 guides pipeline. After `guideIngest` extracts questions from a worksheet PDF, it publishes a single message to `solution-generation-queue`. This worker receives that message, loads the guide's questions from Postgres, and calls Claude Sonnet 4.6 once per question — forcing the `generate_solution` tool — to produce a canonical step-by-step solution key including the final answer, ordered steps with LaTeX and Spanish explanations, checkpoint flags, expected error tags, and optional alternative derivation paths. When every question in the guide has been solved, the guide is flipped to `REVIEW` status and a deduped teacher alert is raised so the teacher knows the solution key is ready for review. The generated solution key later serves as the `pauta` (answer key) used by the downstream `submissionGrader` worker to grade student handwritten submissions.
+
+---
+
+## Lambda configuration
+
+<CardGroup cols={2}>
+  <Card title="Handler" icon="code">
+    `src.pipeline.solution_generator.handler`
+  </Card>
+  <Card title="Trigger" icon="bolt">
+    SQS `solution-generation-queue` — ARN via `SQS_SOLUTION_GEN_ARN`
+  </Card>
+  <Card title="Batch size" icon="layer-group">
+    **1** — one guide per invocation (fans out to per-question LLM calls)
+  </Card>
+  <Card title="Resources" icon="server">
+    Timeout: **600 s** · Memory: **1024 MB**
+  </Card>
+</CardGroup>
+
+<Note>
+  Batch size is intentionally 1. A single guide may contain many questions, each requiring its own Sonnet call plus a topic-classification step. Grouping multiple guides per invocation would risk hitting the 600 s Lambda timeout.
+</Note>
+
+---
+
+## SQS message schema
+
+`guideIngest` publishes a `SolutionGenMessage` as the body of each SQS record. The same schema is also used for per-question re-generation triggered by the backend.
+
+```python
+class SolutionGenMessage(BaseModel):
+    """Outbound SQS body: ai-engine -> `solution-generation-queue`.
+
+    `guide_question_id = None` means 'the whole guide' (A7 default)."""
+
+    guide_id: str
+    guide_question_id: str | None = None   # None = solve all questions
+    trace_id: str = ""
+```
+
+<ParamField body="guide_id" type="str" required>
+  UUID of the `Guide` record in Postgres. Used to load all unsolved questions via `repo.load_guide_context`.
+</ParamField>
+
+<ParamField body="guide_question_id" type="str | null">
+  When `null` (the default published by `guideIngest`), the worker solves every question in the guide. When set to a specific question UUID, only that question is (re-)generated — used by the backend's teacher-facing "regenerate solution" action.
+</ParamField>
+
+<ParamField body="trace_id" type="str">
+  Correlation ID forwarded from the upstream `guideIngest` message. Bound to structlog context for end-to-end log tracing.
+</ParamField>
+
+---
+
+## Execution flow
+
+<Steps>
+  <Step title="Load guide context from Postgres">
+    `repo.load_guide_context(guide_id, guide_question_id)` fetches a `GuideContext` that includes the guide's metadata and all questions to be solved:
+
+    ```python
+    class GuideContext(BaseModel):
+        guide_id: str
+        course_id: str
+        subject_id: str
+        grade_level: int
+        teacher_id: str
+        title: str
+        question_count: int
+        questions: list[QuestionToSolve]
+
+    class QuestionToSolve(BaseModel):
+        question_id: str
+        sequence: int
+        label: str | None
+        statement_latex: str
+        provided_answer: str | None
+        provided_solution_latex: str | None
+        points: float = 1.0
+        current_version: int = 0   # max existing GuideSolution.version (0 = none)
+    ```
+
+    If the context is `None` or has no questions, the worker returns early with `processed: 0` and logs a warning.
+  </Step>
+
+  <Step title="Fetch taxonomy candidates">
+    `repo.fetch_taxonomy_candidates(grade_level)` loads the error-taxonomy subdomains for the guide's grade band (grade ±1, clamped to ≥1). These `TopicCandidate` records — each containing a `code`, human-readable `name`, and optional links to `topic_id`, `domain_id`, and `subdomain_id` — are passed to Sonnet so the model can classify each question's topic in the same call that generates the solution.
+
+    ```python
+    class TopicCandidate(BaseModel):
+        code: str
+        name: str
+        topic_id: str | None = None
+        domain_id: str | None = None
+        subdomain_id: str | None = None
+        domain_code: str | None = None
+        grade_level: int
+    ```
+  </Step>
+
+  <Step title="Determine generation mode per question">
+    For each question, `decide_mode` inspects what the PDF extraction carried and picks one of three modes:
+
+    ```python
+    class GenerationMode(StrEnum):
+        VALIDATE = "VALIDATE"   # provided_solution_latex present → normalize + cross-check
+        DERIVE   = "DERIVE"     # only provided_answer present → derive and verify
+        FULL     = "FULL"       # nothing from PDF → generate from scratch
+    ```
+
+    | Mode | Condition | Review risk |
+    |---|---|---|
+    | `VALIDATE` | `provided_solution_latex` is non-empty | Low — cross-checked against PDF |
+    | `DERIVE` | `provided_answer` is non-empty | Medium — derivation must reach the PDF answer |
+    | `FULL` | Neither field present | Always flagged `NEEDS_REVIEW` |
+  </Step>
+
+  <Step title="Generate solution with Claude Sonnet (SonnetSolutionGenerator)">
+    `SonnetSolutionGenerator.generate(...)` sends a text-only user turn (the `statement_latex`, mode hint, and candidate topic list) to **Claude Sonnet 4.6**, forcing the `generate_solution` tool. The system prompt is marked `cache_control: ephemeral` and temperature is `0.0`.
+
+    The tool returns a `GeneratedSolution`:
+
+    ```python
+    class GeneratedSolution(BaseModel):
+        topic_code: str | None = None          # matched taxonomy code
+        topic_confidence: float                # 0.0–1.0
+        final_answer: str
+        steps: list[SolutionStep]
+        alt_paths: list[AltPath]               # alternative valid derivations
+        validation_notes: str | None = None    # discrepancy vs PDF solution
+        matches_provided: bool | None = None   # None in FULL mode
+
+    class SolutionStep(BaseModel):
+        latex: str
+        explanation_es: str                    # Spanish explanation
+        checkpoint: bool = False               # intermediate graded result
+        expected_error_tags: list[str]         # error taxonomy codes
+    ```
+  </Step>
+
+  <Step title="Resolve topic and constrain error tags">
+    The returned `topic_code` is looked up in the in-memory candidate index. If resolved, `repo.fetch_active_error_codes(domain_id)` fetches the ACTIVE error tag codes for that domain. `sanitize_solution` then strips any `expected_error_tags` on each step that are not in the allowed set — preventing the model from hallucinating invalid taxonomy codes.
+
+    If the domain cannot be resolved, all `expected_error_tags` are cleared (empty `allowed` set).
+  </Step>
+
+  <Step title="Determine question status (EXTRACTED vs NEEDS_REVIEW)">
+    `resolve_status` applies the following rules to decide whether the question needs teacher attention:
+
+    | Condition | Status |
+    |---|---|
+    | `topic_confidence < SOLUTION_TOPIC_MIN_CONFIDENCE` | `NEEDS_REVIEW` |
+    | Topic code not resolved in candidate index | `NEEDS_REVIEW` |
+    | Mode is `FULL` (nothing came from the PDF) | `NEEDS_REVIEW` |
+    | `matches_provided = False` (VALIDATE/DERIVE didn't reach PDF answer) | `NEEDS_REVIEW` |
+    | `validation_notes` is non-empty | `NEEDS_REVIEW` |
+    | All signals strong | `EXTRACTED` |
+  </Step>
+
+  <Step title="Persist solution to Postgres">
+    `repo.save_solution(...)` writes to `guide_solutions` with:
+
+    - `version`: `current_version + 1`
+    - `source`: `PDF_PROVIDED` (VALIDATE) or `LLM_GENERATED` (DERIVE/FULL)
+    - `status`: `EXTRACTED` or `NEEDS_REVIEW`
+    - `steps_json`: canonical ADR-118 document (see below)
+    - `expected_error_tags`: de-duplicated union of all main-path step tags
+    - `topic_confidence`, `validation_notes`, `model` (`claude-sonnet-4-6`), `prompt_version`
+  </Step>
+
+  <Step title="Set guide to REVIEW when all questions are solved">
+    After every question is processed, `repo.count_unsolved(guide_id)` checks whether any questions remain without a solution. When the count reaches zero, `repo.mark_guide_review_and_alert(...)` atomically:
+
+    1. Sets the guide's status to **`REVIEW`**
+    2. Creates a deduped `TeacherAlert` so the teacher is notified that the solution key is ready
+
+    The outcome is logged as `guide_status: "REVIEW"` and `alert_created: true/false`.
+  </Step>
+</Steps>
+
+---
+
+## Solution output schema
+
+The canonical solution document persisted to `guide_solutions.steps_json` follows ADR-118 and must satisfy both the backend's `canonicalSolutionSchema` and the frontend Zod parser. The `final_answer`, `points`, and per-step `idx` fields are mandatory.
+
+```json
+{
+  "final_answer": "x = 3",
+  "points": 1.0,
+  "steps": [
+    {
+      "idx": 0,
+      "latex": "2x + 1 = 7",
+      "explanation_es": "Planteamos la ecuación original.",
+      "checkpoint": false,
+      "expected_error_tags": []
+    },
+    {
+      "idx": 1,
+      "latex": "2x = 6",
+      "explanation_es": "Restamos 1 a ambos lados.",
+      "checkpoint": false,
+      "expected_error_tags": ["ALG_TRANS_SIGN"]
+    },
+    {
+      "idx": 2,
+      "latex": "x = 3",
+      "explanation_es": "Dividimos ambos lados entre 2.",
+      "checkpoint": true,
+      "expected_error_tags": ["ALG_DIV_COEFF"]
+    }
+  ],
+  "alt_paths": []
+}
+```
+
+<Info>
+  `checkpoint: true` marks a step whose intermediate result a student is graded on by the `submissionGrader` worker. This is the field that links the solution key to per-step grading rubrics.
+</Info>
+
+---
+
+## Worker outcome schema
+
+The handler logs the per-guide summary and returns it in the Lambda response.
+
+```python
+class GuideSolveOutcome(BaseModel):
+    guide_id: str
+    processed: int = 0              # number of questions solved this invocation
+    needs_review_count: int = 0     # questions flagged NEEDS_REVIEW
+    guide_status: str               # "REVIEW" or "GENERATING_SOLUTIONS"
+    alert_created: bool = False     # True if a new TeacherAlert was raised
+```
+
+---
+
+## Configuration environment variables
+
+<ParamField body="SOLUTION_GEN_USE_BATCHES" type="bool" default="true">
+  When `true`, questions are processed in batches for cost efficiency. This setting is read by the service layer to determine whether to group questions into a single batched Sonnet call or invoke the model once per question sequentially. Defaults to `true` in production.
+</ParamField>
+
+<ParamField body="SOLUTION_TOPIC_MIN_CONFIDENCE" type="float" default="0.85">
+  Minimum `topic_confidence` score (range `0.0`–`1.0`) for a topic classification to be considered resolved. If Sonnet returns a confidence below this threshold the question is flagged `NEEDS_REVIEW`, even if the solution steps are otherwise correct. A higher value ensures teachers verify more classifications; a lower value accepts weaker signals automatically.
+</ParamField>
+
+<Tip>
+  Lower `SOLUTION_TOPIC_MIN_CONFIDENCE` only after reviewing the `M_NEEDS_REVIEW_RATIO` metric in CloudWatch. A sharp drop in the ratio may indicate the model is over-confidently classifying topics outside the taxonomy.
+</Tip>
+
+---
+
+## Error handling and partial batch failure
+
+The worker implements the SQS **`ReportBatchItemFailures`** protocol identically to `guideIngest`. Each record is processed inside an independent `try/except` block.
+
+| Exception | Behavior |
+|---|---|
+| `PausedError` | SSM killswitch active — record returned to queue; logged as `solution_gen_paused` |
+| Any other exception | Record returned to queue; logged as `solution_gen_record_failed` |
+
+```python
+# Partial-batch response shape
+{
+    "processed": int,
+    "batchItemFailures": [{"itemIdentifier": "<messageId>"}, ...]
+}
+```
+
+---
+
+## SSM killswitch
+
+<Warning>
+  Setting the SSM parameter at `SSM_GUIDES_SOLUTION_PAUSED_PARAM` (default path `/innova/guides/solution_paused`) to a truthy value pauses this worker without a redeploy. In-flight messages are returned to the queue and retried once the switch is cleared. Use this to halt solution generation during peak cost periods without affecting the ingest or grading stages.
+</Warning>
+
+<ParamField body="SSM_GUIDES_SOLUTION_PAUSED_PARAM" type="string" default="/innova/guides/solution_paused">
+  SSM Parameter Store path checked before every Sonnet call inside `SonnetSolutionGenerator.generate`. Set the parameter value to any truthy string to pause.
+</ParamField>
+
+---
+
+## Downstream: submissionGrader and the `pauta`
+
+Once the guide reaches `REVIEW` status and the teacher approves the solution key, the generated steps become the **`pauta`** (answer key) for the `submissionGrader` worker (A8). When a student uploads photos of their handwritten worksheet, `submissionGrader` fetches the `guide_solutions` rows — specifically the `steps_json` with checkpoint steps — and uses them as the reference when transcribing and grading each answer. The `expected_error_tags` on each step seed the error-classification taxonomy used to categorize student mistakes.
+
+---
+
+## Observability
+
+| Signal | Detail |
+|---|---|
+| `M_NEEDS_REVIEW_RATIO` | CloudWatch custom metric; emitted as `needs_review / processed` at the end of each successful invocation |
+| Structured logs | `solution_gen_done`, `solution_generated`, `solution_gen_no_questions`, `solution_gen_paused`, `solution_gen_record_failed` — all include `guide_id` and `trace_id` |
+| Per-question log | `solution_generated` includes `question_id`, `mode`, `topic_code`, `topic_confidence`, and `steps` count |
+| Guide completion log | `solution_gen_done` includes `guide_status`, `needs_review`, `alert_created`, and `processed` |

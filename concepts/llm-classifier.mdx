@@ -1,0 +1,226 @@
+---
+title: "LLM Error Classifier: Procedural Math Error Detection"
+sidebarTitle: "LLM Classifier"
+description: "How Claude Haiku classifies unclassified student attempts in batches of 20 against a 2,600+ error taxonomy using prompt caching and forced tool_use."
+---
+
+The LLM Error Classifier is the final layer in a two-stage pipeline that identifies *which* procedural error a student made in a math problem. The first stage is a deterministic rule engine (running in the TypeScript backend) that resolves roughly 70–85 % of attempts in real time. The remaining 15–30 % — attempts that match no rule — are marked `UNCLASSIFIED` and enqueued to `llm-classify-queue`. An async Lambda consumer (`llmClassifier`) then groups those attempts by math domain, calls Claude Haiku in batches of up to 20 attempts per API call, and writes the resulting `error_type` back to Postgres. This design (ADR-005) accepts a ~5-minute classification latency in exchange for a **7× cost reduction** via prompt caching and batching — acceptable because teachers consult the error dashboard the following day, not in real time.
+
+## Error Taxonomy
+
+The classifier operates against a proprietary taxonomy of **2,600+ procedural errors** aligned to the Chilean MINEDUC curriculum. The taxonomy is structured across **17 math domains** spanning grades 1–12 (3°–6° básico being the primary target for the current pilot):
+
+| Domain Code | Title | Grade Range |
+|---|---|---|
+| `ARITH` | Arithmetic with natural numbers | G1–G6 |
+| `FRACT` | Fractions | G4–G8 |
+| `DEC` | Decimal numbers | G5–G8 |
+| `ALGEBRA` | Algebra (expressions, equations, systems) | G7–G12 |
+| `GEOM` | Plane geometry | G3–G10 |
+| `STAT` | Statistics | G4–G12 |
+| `TRIG` | Trigonometry | G10–G12 |
+| `TRANSV` | Transversal (cross-cutting) procedural errors | G1–G12 |
+| *(+ 9 more)* | INT, RATIO, POW, FUNC, GEOM3D, DATA, LOG, SEQ, COORD | Various |
+
+Each `ErrorTag` record in the database has a `code`, `name`, `description`, and optional `diagnostic_hint`. Tags transition through `DRAFT → ACTIVE` states; only `ACTIVE` tags are loaded into prompts. Activating or deprecating a tag requires a re-import, re-codegen, and backend redeploy.
+
+## Batching and Domain Routing
+
+<Steps>
+  <Step title="Receive SQS batch">
+    The `llmClassifier` Lambda receives up to 20 `Attempt` objects from `llm-classify-queue` in a single SQS batch.
+  </Step>
+  <Step title="Group by domain">
+    Attempts are grouped by their `domain_id` (a UUID the backend embeds in the SQS message body, introduced in v8). Each domain gets its own Claude call with a domain-specialised prompt and a constrained tool enum — this is the `_group_by_domain` routing step described in ADR A4.3.
+  </Step>
+  <Step title="Fetch ACTIVE catalog">
+    For each domain, `get_domain_catalog` queries the `error_tags` table for all `ACTIVE` tags belonging to that domain. Results are cached in-process with a **1-hour TTL** (ADR A4.2) to avoid redundant DB round-trips across invocations in the same warm Lambda container.
+  </Step>
+  <Step title="Call Claude Haiku">
+    Each domain batch is sent to Claude Haiku with a cached system prompt + forced `tool_use`. Attempts without a resolvable `domain_id` fall back to the generic v7 prompt with the full static taxonomy.
+  </Step>
+  <Step title="Write results">
+    Each `AttemptClassification` is upserted back to the `attempt_classifications` table, and the parent attempt's `status` is updated based on the returned `error_type`.
+  </Step>
+</Steps>
+
+## Prompt Caching
+
+The most expensive part of each Claude call is re-sending the full error taxonomy for every request. Innova eliminates this cost by placing the system prompt (including the entire domain taxonomy) in an **ephemeral `cache_control` block**:
+
+```python
+response = client.messages.create(
+    model=_MODEL,
+    max_tokens=1024,
+    temperature=0.0,
+    system=[
+        {
+            "type": "text",
+            "text": system_text,
+            "cache_control": {"type": "ephemeral"},
+        }
+    ],
+    tools=[tool],
+    tool_choice={"type": "tool", "name": "classify_errors"},
+    messages=[{"role": "user", "content": user_content}],
+)
+```
+
+Anthropic caches the system block server-side for up to 5 minutes. As long as the taxonomy does not change (it only changes on a deploy), **all batches within a warm window share the cached tokens**, reducing input token cost by approximately **7×** compared to per-attempt calls (ADR-005).
+
+<Warning>
+  CI enforces that `cache_control: {"type": "ephemeral"}` remains on the system block. Removing it silently breaks caching and multiplies costs.
+</Warning>
+
+## Forced `tool_use`
+
+The classifier uses `tool_choice={"type": "tool", "name": "classify_errors"}` to guarantee that Claude always returns structured JSON rather than prose. The tool schema enforces a strict `enum` of valid `error_type` values for the domain being classified:
+
+```python
+def build_classify_tool(error_codes: Sequence[str]) -> dict[str, Any]:
+    """v8 — build a classify_errors tool whose error_type enum is the ACTIVE
+    catalog of a single domain plus the special values."""
+    enum_values = [*error_codes, *SPECIAL_ERROR_TYPES]
+    return {
+        "name": "classify_errors",
+        "description": "Classify procedural math errors for a batch of student attempts.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "classifications": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 25,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "attempt_id": {"type": "string"},
+                            "error_type": {"type": "string", "enum": enum_values},
+                            "evidence": {"type": "string", "maxLength": 300},
+                            "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                        },
+                        "required": ["attempt_id", "error_type", "evidence", "confidence"],
+                    },
+                }
+            },
+            "required": ["classifications"],
+        },
+    }
+```
+
+Constraining the `enum` to the domain's `ACTIVE` error codes ensures that the `error_type` returned is always a valid foreign key into the `ErrorTag` table — preventing FK violations on the backend write.
+
+## Sentinel Values
+
+Three special `error_type` values are valid across all domains and are always included in the tool enum regardless of catalog content:
+
+<CardGroup cols={3}>
+  <Card title="CORRECT" icon="circle-check">
+    The student's answer matches the canonical solution. Sets the attempt `status` to `CORRECT` in the backend; no error record is created.
+  </Card>
+  <Card title="UNCLASSIFIED" icon="circle-question">
+    No known error pattern was detected. The attempt remains unresolved; it may be surfaced to a human reviewer or flagged for taxonomy expansion.
+  </Card>
+  <Card title="TRANSVERSAL_LIKELY" icon="arrows-left-right">
+    The error is real but cross-cutting (e.g. sign handling, transcription, units) — not specific to the current domain. Defers to a second-pass classification against the `TRANSV` domain catalog (ADR A4.4).
+  </Card>
+</CardGroup>
+
+## Input and Output Schemas
+
+### `Attempt` — Input
+
+```python
+class Attempt(BaseModel):
+    id: str
+    topic: str | None = None
+    problem_statement: str
+    canonical_solution: str
+    raw_steps: list[object]
+    final_answer: str
+    student_id: str = ""
+    domain_id: str | None = None
+    subdomain_code: str | None = None
+```
+
+<ParamField path="id" type="str" required>
+  Opaque attempt identifier. Passed through to `AttemptClassification.attempt_id` so results can be joined back to the correct row without any PII.
+</ParamField>
+
+<ParamField path="topic" type="str | None">
+  Optional teacher-confirmed topic code. `null` for exercises not yet pinned to a Topic by a teacher (common for K-12 questions after the v9.1 taxonomy migration).
+</ParamField>
+
+<ParamField path="problem_statement" type="str" required>
+  The exercise text as presented to the student.
+</ParamField>
+
+<ParamField path="canonical_solution" type="str" required>
+  The reference (correct) solution against which the student's work is compared.
+</ParamField>
+
+<ParamField path="raw_steps" type="list[object]" required>
+  The student's step-by-step work, as extracted by the rule engine or OCR pipeline. Structure may vary; Claude receives it as-is serialised to JSON.
+</ParamField>
+
+<ParamField path="final_answer" type="str" required>
+  The student's final submitted answer.
+</ParamField>
+
+<ParamField path="domain_id" type="str | None">
+  Domain UUID (v8+). Used by the consumer to route the attempt to the correct domain catalog. Omitting this field causes fallback to the generic v7 prompt.
+</ParamField>
+
+<ParamField path="subdomain_code" type="str | None">
+  Subdomain code used as a label in the prompt when `topic` is null.
+</ParamField>
+
+### `AttemptClassification` — Output
+
+```python
+class AttemptClassification(BaseModel):
+    attempt_id: str
+    error_type: str
+    evidence: str
+    confidence: float = Field(ge=0.0, le=1.0)
+```
+
+<ParamField path="attempt_id" type="str" required>
+  Mirrors `Attempt.id`. Used as the join key when writing results back to Postgres.
+</ParamField>
+
+<ParamField path="error_type" type="str" required>
+  An `ACTIVE` error tag code from the domain catalog, or one of the three sentinel values (`CORRECT`, `UNCLASSIFIED`, `TRANSVERSAL_LIKELY`).
+</ParamField>
+
+<ParamField path="evidence" type="str" required>
+  A natural-language explanation (max 300 characters) of which step revealed the error and why. Shown to teachers in the dashboard.
+</ParamField>
+
+<ParamField path="confidence" type="float" required>
+  Model-reported confidence score in `[0.0, 1.0]`. Attempts where Haiku returns `confidence < 0.7` (~5 % of volume) are re-classified by Claude Sonnet 4.6 (ADR-009).
+</ParamField>
+
+## Model Selection
+
+| Condition | Model used |
+|---|---|
+| Default path | `claude-haiku-4-5-20251001` |
+| `confidence < 0.7` escalation | `claude-sonnet-4-6` (Sonnet 4.6) |
+
+<Info>
+  **No PII is ever sent to Anthropic.** The user payload contains only `attempt_id`, `topic` / `subdomain`, `problem_statement`, `canonical_solution`, `raw_steps`, and `final_answer`. `student_id` is present on the `Attempt` schema for internal routing but is **excluded** from the serialised payload sent to the API (`_user_payload` omits it explicitly).
+</Info>
+
+## SSM Kill-Switch
+
+Every Claude call is gated by an SSM Parameter Store check:
+
+```python
+def _ensure_not_paused(trace_id: str) -> None:
+    paused = get_ssm_param(settings.ssm_llm_paused_param)
+    if paused.lower() == "true":
+        raise PausedError("LLM paused by cost killswitch")
+```
+
+Setting `/innova/llm/paused = true` in SSM immediately halts all LLM classification without a redeploy. Affected SQS messages are dropped to the DLQ with `paused_due_to_cost` metadata for later replay.

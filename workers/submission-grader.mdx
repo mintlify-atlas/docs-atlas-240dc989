@@ -1,0 +1,180 @@
+---
+title: "submissionGrader: Student Work Grading Worker"
+sidebarTitle: "Submission Grader"
+description: "SQS worker that transcribes and grades student photo submissions using Claude Haiku vision, then publishes attempt data back to the attempt-reprocess queue."
+---
+
+The `submissionGrader` worker is the entry point for grading handwritten student work in the v9 guides pipeline. When a student uploads photos of their solved exercise, the backend enqueues a lightweight `GradeSubmissionMessage` — containing only a `guide_submission_id` — to the `submission-grade-queue`. The worker loads the full submission context (photos, solution key, domain catalog) from Postgres and S3, calls `HaikuVisionGrader` to transcribe the handwriting and align the student's steps against the official pauta, and publishes a `ReprocessMessage` to the `attempt-reprocess-queue` so the backend can create the corresponding attempt records. Submissions that are illegible after one retry are closed as `GRADED` with an illegible note; the student can re-upload. Every call records token usage and estimated cost.
+
+## Trigger & configuration
+
+<CardGroup cols={2}>
+  <Card title="Queue" icon="list-check">
+    SQS `submission-grade-queue`  
+    ARN from env `SQS_SUBMISSION_GRADE_ARN`
+  </Card>
+  <Card title="Lambda settings" icon="bolt">
+    Timeout: **120 s** · Memory: **512 MB**  
+    Handler: `src.pipeline.submission_grader.handler`
+  </Card>
+</CardGroup>
+
+| Setting | Value |
+|---|---|
+| `batchSize` | `5` |
+| `functionResponseType` | `ReportBatchItemFailures` |
+
+## SQS message body — `GradeSubmissionMessage`
+
+Each record body is a JSON-serialised `GradeSubmissionMessage`. The message is intentionally minimal — all grading context is loaded from Postgres by the worker.
+
+```json
+{
+  "guide_submission_id": "uuid-of-the-guide-submission",
+  "trace_id": "trace-uuid-or-empty-string"
+}
+```
+
+<ParamField body="guide_submission_id" type="string" required>
+  UUID of the `guide_submissions` row. The worker uses this to load photos, the current solution version, the pauta JSON, and the domain catalog from Postgres.
+</ParamField>
+
+<ParamField body="trace_id" type="string">
+  Optional trace identifier for log correlation across the full pipeline. Defaults to an empty string.
+</ParamField>
+
+## Execution flow
+
+<Steps>
+  <Step title="Load submission context from Postgres">
+    `repo.load_submission_context(guide_submission_id)` retrieves everything the grader needs: `photo_keys` (S3 paths), `grade_level`, `solution_steps_json` (canonical ADR-118 document), `solution_final_answer`, `domain_id`, and `domain_catalog_text`. If no context row is found, the submission is immediately closed as `FAILED`.
+  </Step>
+  <Step title="Download photos from S3">
+    Photo bytes are fetched from `S3_SUBMISSIONS_BUCKET` using the keys stored in `SubmissionContext.photo_keys`. If `photo_keys` is empty, the submission is closed as `FAILED` with reason `"no photos"`.
+  </Step>
+  <Step title="Transcribe and grade with HaikuVisionGrader">
+    `HaikuVisionGrader.grade(images, ...)` makes one `claude-haiku-4-5` vision call with:
+    - All photo bytes as base64-encoded `image/jpeg` content blocks
+    - Two cached system blocks: the static grading system prompt, and a per-question pauta + domain catalog block (both with `cache_control: ephemeral`)
+    - Forced `tool_choice: {"type": "tool", "name": "transcribe_and_align"}`
+
+    If the transcription confidence is below `GRADING_MIN_TRANSCRIPTION_CONFIDENCE`, the call is retried exactly once. The cost of both calls is accumulated.
+  </Step>
+  <Step title="Confidence gate — illegibility check">
+    If after the retry the `transcription.confidence` is still below `GRADING_MIN_TRANSCRIPTION_CONFIDENCE` (default `0.5`), the submission is closed as `GRADED` with `failure_reason = "ILLEGIBLE"`. No reprocess message is published — the student must re-upload.
+
+    ```python
+    if not is_legible(result.transcription, min_conf):
+        # close as GRADED / ILLEGIBLE — no reprocess
+        ...
+        return GradeOutcome(illegible=True, ...)
+    ```
+  </Step>
+  <Step title="Persist grading result">
+    `repo.save_grading(...)` writes the transcription LaTeX, full transcription JSON, alignment JSON (alignment path + per-step verdicts), provisional score, `is_correct`, and the solution version used. Status is set to `GRADING` (the backend's rule engine will advance it to `GRADED`).
+  </Step>
+  <Step title="Publish to attempt-reprocess queue">
+    A `ReprocessMessage` is published to `SQS_ATTEMPT_REPROCESS_URL`:
+
+    ```json
+    {
+      "attempt_id": null,
+      "guide_submission_id": "uuid",
+      "guide_question_id": "uuid",
+      "latex_steps": ["2x = 4", "x = 2"],
+      "provider": "claude-haiku",
+      "confidence": 0.93,
+      "alignment_summary": {
+        "path": "MAIN",
+        "first_error_checkpoint": null,
+        "score_0_1": 1.0
+      },
+      "trace_id": "trace-uuid"
+    }
+    ```
+
+    `attempt_id: null` distinguishes this from a normal attempt reprocess, allowing the backend to route it through the guide-submission path.
+  </Step>
+</Steps>
+
+## Grading outcome schema — `GradeOutcome`
+
+```python
+class GradeOutcome(BaseModel):
+    guide_submission_id: str
+    status: str              # submission status: GRADING | GRADED | FAILED
+    score: float | None      # provisional score in [0.0, 1.0]; null on failure/illegible
+    is_correct: bool | None  # provisional correctness; null on failure/illegible
+    illegible: bool          # True when transcription confidence is below the floor
+    published: bool          # True when ReprocessMessage was published
+    failure_reason: str | None
+```
+
+## `TranscribeAndAlign` — grader tool output
+
+`HaikuVisionGrader` uses a single forced tool call and returns a `TranscribeAndAlign` object:
+
+```python
+class TranscribeAndAlign(BaseModel):
+    transcription: Transcription   # student steps as LaTeX + confidence
+    alignment: Alignment           # how steps map to the solution checkpoints
+    provisional: Provisional       # is_correct, score_0_1, first_error_step_idx
+```
+
+### Transcription
+
+```python
+class Transcription(BaseModel):
+    steps: list[TranscriptionStep]  # idx, latex, legible
+    final_answer: str | None
+    confidence: float               # 0.0 – 1.0
+```
+
+### Alignment
+
+```python
+class Alignment(BaseModel):
+    matches: list[AlignMatch]   # student_step_idx → solution_checkpoint_idx + verdict
+    path: str                   # "MAIN" | "ALT_<n>" | "UNALIGNED"
+```
+
+Each `AlignMatch.verdict` is one of `OK`, `ERROR`, or `SKIPPED`.
+
+### Provisional
+
+```python
+class Provisional(BaseModel):
+    is_correct: bool
+    score_0_1: float            # 0.0 – 1.0
+    first_error_step_idx: int | None
+```
+
+## `cheap_mode` SSM flag
+
+The worker reads a second SSM parameter named by `SSM_GUIDES_CHEAP_MODE_PARAM` (default `/innova/guides/grading_cheap_mode`). When this flag is active, grading quality is downgraded — for example, by reducing the number of vision tokens or skipping the retry pass — to limit inference spend during cost-pressure periods.
+
+<Info>
+  `cheap_mode` is a soft quality reduction, not a full pause. Grading continues but may produce less accurate results. Use the hard killswitch (`SSM_GUIDES_GRADING_PAUSED_PARAM`) to stop grading entirely.
+</Info>
+
+## Cost killswitch
+
+`HaikuVisionGrader` calls `ensure_not_paused(ssm_guides_grading_paused_param)` before every Anthropic call. The parameter name is set by `SSM_GUIDES_GRADING_PAUSED_PARAM` (default `/innova/guides/grading_paused`). When its value is `"true"`, a `PausedError` is raised.
+
+<Warning>
+  When `PausedError` is raised, the handler adds the message's `itemIdentifier` to `batchItemFailures` and logs `submission_grade_paused`. SQS redelivers the message after the visibility timeout expires — no data is lost, but grading is deferred until the killswitch is cleared.
+</Warning>
+
+## Partial batch failure handling
+
+The handler processes records in a `for` loop and tracks failures separately:
+
+| Exception | `batchItemFailures` | Behaviour |
+|---|---|---|
+| `PausedError` | ✅ added | Message returned to queue for later retry |
+| Any other exception | ✅ added | Message returned to queue for later retry |
+| `GraderResponseError` (unreadable response) | ❌ not added | Submission closed as `FAILED`; message deleted |
+
+<Note>
+  `GraderResponseError` is treated as terminal. Re-delivering a submission whose photo the model cannot parse at all would re-bill the vision call for the same result. The worker closes the submission as `FAILED` and deletes the SQS message so it is never retried. The student can re-upload to create a new submission.
+</Note>

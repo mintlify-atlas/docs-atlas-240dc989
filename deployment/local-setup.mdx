@@ -1,0 +1,166 @@
+---
+title: "Local Development Setup for Innova AI Engine"
+sidebarTitle: "Local Setup"
+description: "Set up a local Innova AI Engine development environment with Python 3.11, uv, Docker, and shared backend infrastructure in under 15 minutes."
+---
+
+By the end of this guide you will have a fully functional local copy of the Innova AI Engine running against shared infrastructure, passing lint and type checks, and executing the full test suite — without touching any cloud resources. The engine powers knowledge tracing (BKT/IRT), LLM error classification, document AI, and OCR for the SuperProfe platform, so your local environment mirrors exactly what runs on AWS Lambda in production.
+
+## Prerequisites
+
+Before you begin, make sure you have the following installed and available:
+
+- **Python 3.11** — the version is pinned in `.python-version`; other versions are not supported
+- **`uv` package manager** — see the [uv installation docs](https://docs.astral.sh/uv/) (`curl -LsSf https://astral.sh/uv/install.sh | sh`)
+- **Docker** — required to run the shared Postgres, MongoDB, and LocalStack services via the backend's `docker-compose`
+- **Anthropic and Gemini API keys** — only needed if you intend to call those providers directly; the test suite mocks them
+
+---
+
+## Setup
+
+<Steps>
+  <Step title="Clone the repo and install dependencies">
+    Clone the repository and let `uv` bootstrap the virtual environment and install all packages including dev extras:
+
+    ```bash
+    git clone https://github.com/vruizz22/innova-ai-engine.git
+    cd innova-ai-engine
+    uv sync --all-extras
+    ```
+
+    `uv sync --all-extras` creates a `.venv` automatically, pins everything to the resolved `uv.lock`, and installs dev dependencies (`pytest`, `hypothesis`, `moto`, `ruff`, `pyright`, and friends).
+  </Step>
+
+  <Step title="Copy and configure the environment file">
+    ```bash
+    cp .env.example .env
+    ```
+
+    Open `.env` and fill in at minimum:
+
+    | Variable | Why it's required |
+    |---|---|
+    | `ANTHROPIC_API_KEY` | Any worker that calls Claude will fail without it (can be a dummy for pure math tests) |
+    | `GEMINI_API_KEY` | Required by OCR and guide-ingest workers |
+    | `DATABASE_URL` | Points to the local Postgres instance started in the next step |
+    | `MONGODB_URI` | Points to the local MongoDB instance started in the next step |
+
+    The `.env.example` ships with sane defaults for the local Docker ports — `DATABASE_URL` defaults to `postgresql://postgres:innova_secret@localhost:5433/innova_dev_db` and `MONGODB_URI` to `mongodb://root:innova_mongo_secret@localhost:27017/innova_ai_engine_local?authSource=admin`.
+
+    <Note>
+      All other variables (SQS ARNs, S3 buckets, SSM parameters, tuning knobs) have defaults in `.env.example` and are only strictly needed when exercising the full pipeline end-to-end against LocalStack or real AWS.
+    </Note>
+  </Step>
+
+  <Step title="Start shared infrastructure">
+    The engine shares Postgres, MongoDB, and LocalStack with `innova-backend-serverless`. Start those services from the backend repo:
+
+    ```bash
+    # From the sibling backend repository
+    cd ../innova-backend-serverless
+    docker compose up -d
+    ```
+
+    This exposes Postgres on port **5433**, MongoDB on port **27017**, and LocalStack on port **4566**. Wait for all containers to be healthy before proceeding.
+
+    <Tip>
+      Run `docker compose ps` to confirm all services are `healthy` before moving on.
+    </Tip>
+  </Step>
+
+  <Step title="Run lint">
+    ```bash
+    uv run ruff check src tests
+    ```
+
+    Ruff enforces rule sets `E`, `F`, `I`, `N`, `UP`, `B`, `RUF`, and `T201` at line length 100. Zero issues are required before a PR can merge.
+  </Step>
+
+  <Step title="Run type check">
+    ```bash
+    uv run pyright
+    ```
+
+    Pyright runs in **strict** mode (`typeCheckingMode = "strict"`) targeting Python 3.11. It covers the `src/` tree only (tests are excluded). Zero errors are required.
+  </Step>
+
+  <Step title="Run the test suite">
+    ```bash
+    uv run pytest
+    ```
+
+    This runs the full suite excluding smoke tests (which make real provider calls). No API keys are consumed. See the [Testing guide](/deployment/testing) for details on test categories and coverage gates.
+  </Step>
+</Steps>
+
+---
+
+## Running a worker locally
+
+Lambda handlers are plain Python functions with the signature `handler(event, context)`. You can invoke any handler directly from the command line without a local Lambda runtime.
+
+### Cron workers (no SQS event needed)
+
+The nightly calibration workers accept an empty event dict:
+
+```bash
+# Nightly BKT calibration (grid search over all topics)
+uv run python -c "from src.pipeline.nightly_bkt import handler; handler({}, None)"
+
+# Nightly IRT calibration (L-BFGS-B MLE, ≥50 attempts per exercise)
+uv run python -c "from src.pipeline.nightly_irt import handler; handler({}, None)"
+```
+
+<Warning>
+  These workers connect to the real `DATABASE_URL` in your `.env`. Make sure you're pointing at the local Docker Postgres, **not** a staging or production Supabase URL, before running them.
+</Warning>
+
+### SQS workers
+
+SQS-triggered workers expect a minimal Lambda SQS event envelope. Below is an example for the `llmClassifier`, which processes batches of up to 20 unclassified attempts:
+
+```python
+import json
+from src.pipeline.llm_consumer import handler
+
+# Minimal SQS event envelope
+event = {
+    "Records": [
+        {
+            "messageId": "test-msg-001",
+            "receiptHandle": "fake-receipt-handle",
+            "body": json.dumps({
+                "attempt_id": "clxyz123",
+                "student_steps": ["x + 3 = 5", "x = 5 + 3", "x = 8"],
+                "topic_id": "algebra-linear-1",
+                "domain": "algebra",
+            }),
+            "attributes": {
+                "ApproximateReceiveCount": "1",
+                "SentTimestamp": "1700000000000",
+            },
+            "eventSource": "aws:sqs",
+            "eventSourceARN": "arn:aws:sqs:us-east-1:000000000000:llm-classify-queue",
+            "awsRegion": "us-east-1",
+        }
+    ]
+}
+
+result = handler(event, None)
+print(result)
+```
+
+<Tip>
+  For SQS workers that interact with S3 (guide ingest, submission grader), you can point `AWS_ENDPOINT_URL` to `http://localhost:4566` and use LocalStack in place of real AWS. The `moto` fixtures in `tests/` show exactly how to mock those services in tests.
+</Tip>
+
+---
+
+## Important: DATABASE_URL and the transaction pooler
+
+<Warning>
+  **Do NOT use the Supabase transaction pooler port (`:6543`) for `DATABASE_URL`.**
+
+  The engine uses `asyncpg` with prepared statements. Supabase's transaction pooler (PgBouncer in transaction mode) does not support prepared statements — connections will fail with cryptic protocol errors. Always use the **session pooler on port `:5432`** in production, or the direct Docker Postgres on port **`:5433`** in local development.
+</Warning>
