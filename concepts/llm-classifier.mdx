@@ -218,8 +218,10 @@ Every Claude call is gated by an SSM Parameter Store check:
 
 ```python
 def _ensure_not_paused(trace_id: str) -> None:
+    settings = get_settings()
     paused = get_ssm_param(settings.ssm_llm_paused_param)
     if paused.lower() == "true":
+        logger.warning("llm_paused_by_killswitch", trace_id=trace_id)
         raise PausedError("LLM paused by cost killswitch")
 ```
 

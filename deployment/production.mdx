@@ -89,9 +89,9 @@ The deploy workflow fires on every push to `main` (and supports `workflow_dispat
 
 ```
 Checkout
-  → Configure AWS credentials (OIDC-style via aws-actions/configure-aws-credentials@v5)
+  → Configure AWS credentials (long-term key pair via aws-actions/configure-aws-credentials@v5)
   → Login to Amazon ECR (aws-actions/amazon-ecr-login@v2)
-  → Install uv + serverless@3 + serverless-domain-manager
+  → Install uv + serverless@3 + serverless-domain-manager (global npm install)
   → serverless deploy --stage prod
 ```
 
@@ -109,8 +109,6 @@ Navigate to `https://github.com/vruizz22/innova-ai-engine/settings/secrets/actio
 |---|---|
 | `AWS_ACCESS_KEY_ID` | IAM deploy user access key |
 | `AWS_SECRET_ACCESS_KEY` | IAM deploy user secret |
-| `AWS_REGION` | `us-east-1` |
-| `AWS_ACCOUNT_ID` | AWS account ID (used by ECR login) |
 
 ### Provider keys and database
 
@@ -155,11 +153,11 @@ You can deploy manually from a local machine with AWS credentials configured:
 
 ```bash
 # Deploy all functions to prod
-npx serverless deploy --stage prod
+serverless deploy --stage prod
 
 # Deploy a single function (faster — skips image rebuild if unchanged)
-npx serverless deploy function -f nightlyBkt --stage prod
-npx serverless deploy function -f llmClassifier --stage prod
+serverless deploy function -f nightlyBkt --stage prod
+serverless deploy function -f llmClassifier --stage prod
 ```
 
 <Tip>

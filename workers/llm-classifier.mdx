@@ -1,7 +1,7 @@
 ---
-title: "llmClassifier: Async Error Classification Worker"
+title: "llmClassifier: Student Error Classification Worker"
 sidebarTitle: "LLM Classifier"
-description: "SQS worker that classifies unclassified student attempts against a 2,600+ error taxonomy using Claude Haiku in batches of 20 with prompt caching and forced tool_use."
+description: "SQS worker that classifies student attempts against a 2,600+ error taxonomy using Claude Haiku in batches of 20 with prompt caching and forced tool_use."
 ---
 
 The `llmClassifier` worker is the core error-intelligence pipeline of Innova. It consumes `UNCLASSIFIED` student attempt records from the `llm-classify-queue`, groups them by academic domain, and routes each group to Claude Haiku (claude-haiku-4-5-20251001) for classification against a proprietary 2,600+ error taxonomy aligned to the Chilean K-12 curriculum. Results are written back to the `attempts` table in Postgres with a classifier source, confidence score, and resolved `error_tag_id`. Attempts the model still cannot classify trigger a second-pass suggestion flow that proposes and persists new `error_tag` entries, growing the catalog organically.

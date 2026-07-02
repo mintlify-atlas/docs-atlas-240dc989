@@ -1,7 +1,7 @@
 ---
 title: "OCR Vision Pipeline: Handwritten Math Recognition"
 sidebarTitle: "OCR Vision"
-description: "How the engine reads handwritten student math using Gemini 2.5 Flash as primary OCR with automatic escalation to Claude vision when confidence falls below threshold."
+description: "How the engine reads handwritten student math using Gemini 2.5 Flash as primary OCR, escalating to Claude vision when confidence falls below 0.7."
 ---
 
 Chilean elementary school students do mathematics by hand in paper notebooks. Requiring digital input would lose adoption, so Innova supports a "Subir foto" (upload photo) mode where students photograph their handwritten work and submit it directly. The OCR Vision Pipeline converts those images into structured LaTeX step sequences that the downstream error-classification pipeline can process. To balance cost and accuracy the pipeline uses a **dual-model strategy**: Gemini 2.5 Flash handles all requests first (free tier covers the pilot; ~10× cheaper than Claude at scale per ADR-004), and only escalates to Claude vision when the primary model's confidence score falls below a configurable threshold. The entire strategy is hidden behind the `MathOCRPort` adapter interface, so either backend can be swapped or extended without touching orchestration logic.

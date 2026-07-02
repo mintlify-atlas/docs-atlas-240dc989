@@ -1,7 +1,7 @@
 ---
 title: "solutionGenerator: Step-by-Step Answer Key Builder"
 sidebarTitle: "Solution Generator"
-description: "SQS worker that builds a complete step-by-step solution key for each extracted guide question using Claude Sonnet, setting the guide to REVIEW status when done."
+description: "SQS worker that builds step-by-step solution keys for extracted guide questions using Claude Sonnet, then sets the guide to REVIEW status when complete."
 ---
 
 The `solutionGenerator` worker is the second stage of the v9 guides pipeline. After `guideIngest` extracts questions from a worksheet PDF, it publishes a single message to `solution-generation-queue`. This worker receives that message, loads the guide's questions from Postgres, and calls Claude Sonnet 4.6 once per question — forcing the `generate_solution` tool — to produce a canonical step-by-step solution key including the final answer, ordered steps with LaTeX and Spanish explanations, checkpoint flags, expected error tags, and optional alternative derivation paths. When every question in the guide has been solved, the guide is flipped to `REVIEW` status and a deduped teacher alert is raised so the teacher knows the solution key is ready for review. The generated solution key later serves as the `pauta` (answer key) used by the downstream `submissionGrader` worker to grade student handwritten submissions.

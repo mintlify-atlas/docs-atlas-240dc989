@@ -1,5 +1,5 @@
 ---
-title: "Lambda Workers: Function Reference Overview"
+title: "Lambda Workers: innova-ai-engine Function Reference"
 sidebarTitle: "Overview"
 description: "All ten Lambda functions in innova-ai-engine: their triggers, SQS batch sizes, timeouts, memory allocations, and the handler entry points."
 ---
@@ -19,7 +19,7 @@ The `innova-ai-engine` deploys **ten Lambda functions** from a single container 
 | `guideIngest` | SQS | `guide-ingest-queue` | 1 | 600 s | 2048 MB | `src.pipeline.guide_ingest_worker` |
 | `solutionGenerator` | SQS | `solution-generation-queue` | 1 | 600 s | 1024 MB | `src.pipeline.solution_generator` |
 | `submissionGrader` | SQS | `submission-grade-queue` | 5 | 120 s | 512 MB | `src.pipeline.submission_grader` |
-| `exerciseGenerator` | SQS | `SQS_EXERCISE_GENERATE_ARN` | 1 | 300 s | 512 MB | `src.pipeline.exercise_generator` |
+| `exerciseGenerator` | SQS | `exercise-generate-queue` | 1 | 300 s | 512 MB | `src.pipeline.exercise_generator` |
 
 <Note>
   The `llmClassifier`, `ocrWorker`, `submissionGrader`, `guideIngest`, `solutionGenerator`, and `exerciseGenerator` functions all use `functionResponseType: ReportBatchItemFailures`, meaning a failed item is reported individually rather than failing the entire batch.
@@ -111,5 +111,23 @@ The `src/adhoc_solver/` package (A10) exists in the repository and is fully impl
   </Card>
   <Card title="Hourly Alerts" icon="bell" href="/workers/hourly-alerts">
     EventBridge cron that detects at-risk students and class-level patterns every hour.
+  </Card>
+  <Card title="LLM Classifier" icon="brain" href="/workers/llm-classifier">
+    SQS worker that classifies student attempt errors against the error taxonomy using Claude Haiku in batches of 20.
+  </Card>
+  <Card title="OCR Worker" icon="eye" href="/workers/ocr-worker">
+    SQS worker that transcribes handwritten math submissions using Gemini 2.5 Flash with automatic Claude vision escalation.
+  </Card>
+  <Card title="Guide Ingest" icon="file-pdf" href="/workers/guide-ingest">
+    SQS worker that extracts math questions from uploaded worksheet PDFs using Gemini precheck and Claude Sonnet.
+  </Card>
+  <Card title="Solution Generator" icon="lightbulb" href="/workers/solution-generator">
+    SQS worker that builds step-by-step solution keys for extracted guide questions using Claude Sonnet.
+  </Card>
+  <Card title="Submission Grader" icon="check-circle" href="/workers/submission-grader">
+    SQS worker that transcribes and grades student photo submissions using Claude Haiku vision.
+  </Card>
+  <Card title="Exercise Generator" icon="pencil" href="/workers/exercise-generator">
+    SQS worker that generates new math exercises on teacher request using Claude Haiku forced tool_use.
   </Card>
 </CardGroup>

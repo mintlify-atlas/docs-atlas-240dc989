@@ -1,7 +1,7 @@
 ---
 title: "guideIngest: PDF Worksheet Question Extraction Worker"
 sidebarTitle: "Guide Ingest"
-description: "SQS worker that extracts math questions from uploaded worksheet PDFs using Gemini precheck and Claude Sonnet, then publishes each question to the solution-generation queue."
+description: "SQS worker that extracts math questions from worksheet PDFs using Gemini precheck and Claude Sonnet, then publishes to the solution-generation queue."
 ---
 
 The `guideIngest` worker is the first stage of the v9 guides pipeline. When a teacher uploads a math worksheet PDF, the backend enqueues a message to `guide-ingest-queue`. This worker picks it up and orchestrates a full multi-step extraction pipeline: a cheap Gemini Flash precheck validates the PDF's quality, `pypdfium2` renders pages to images and extracts figure regions, the PDF is sliced into overlapping chunks, and Claude Sonnet runs a forced `extract_guide` tool call per chunk to produce structured questions. All chunks are then merged, deduplicated, figure crops are stored in S3, a `.tex` render is persisted, and each question is published downstream to the `solution-generation-queue` so the `solutionGenerator` worker can build the answer key.

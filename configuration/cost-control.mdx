@@ -83,7 +83,7 @@ The `_PRICING` dictionary in `src/observability/cost.py` stores Anthropic list p
 | `claude-haiku-4-5` | $1.00 | $5.00 | $1.25 | $0.10 |
 
 <Note>
-  Haiku is **15× cheaper** on input tokens than Sonnet. This difference drives the model assignment strategy described below.
+  Haiku is **3× cheaper** on input tokens than Sonnet ($1/M vs $3/M). This difference drives the model assignment strategy described below.
 </Note>
 
 ---
@@ -134,7 +134,7 @@ Each worker is assigned a model deliberately to balance quality against cost:
 
 | Worker | Model | Rationale |
 |---|---|---|
-| `llmClassifier` | `claude-haiku-4-5` | High-volume batch classification; Haiku is 15× cheaper on input and quality is sufficient for taxonomy matching. |
+| `llmClassifier` | `claude-haiku-4-5` | High-volume batch classification; Haiku is 3× cheaper on input and quality is sufficient for taxonomy matching. |
 | `guideIngest` | `claude-sonnet-4-6` | PDF extraction requires high quality and spatial reasoning; Sonnet handles complex multi-column layouts better. |
 | `solutionGenerator` | `claude-sonnet-4-6` | Step-by-step solution key generation requires detailed mathematical reasoning. |
 | `submissionGrader` | `claude-haiku-4-5` (or cheaper when cheap mode active) | Vision grading against a cached *pauta* (solution key); Haiku vision is sufficient for structured rubric scoring. |

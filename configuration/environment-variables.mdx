@@ -1,7 +1,7 @@
 ---
 title: "Environment Variables Reference for Innova AI Engine"
 sidebarTitle: "Environment Variables"
-description: "All environment variables accepted by Innova AI Engine, loaded via pydantic-settings, grouped by concern: API keys, database, AWS, guides pipeline, and alert thresholds."
+description: "Innova AI Engine env var reference: API keys, database URLs, AWS queue ARNs, guides pipeline tuning, kill-switch SSM paths, and hourly-alert thresholds."
 ---
 
 All configuration in Innova AI Engine is driven entirely by environment variables. At startup, `pydantic-settings` reads the `Settings` class defined in `src/shared/settings.py`, validates every field, and exposes a lazily-initialized singleton via `get_settings()`. A local `.env` file is automatically picked up in development (copy `.env.example` to get started); in production, variables are injected by Serverless Framework from the deploying shell's environment — see `serverless.yml`.
@@ -70,6 +70,9 @@ These variables are used by the three guides-pipeline workers: `guideIngest` (A6
 | `SQS_SOLUTION_GEN_URL` | — | HTTPS URL of the solution-generation queue (used by `guideIngest` to publish messages via `boto3`). |
 | `SQS_SUBMISSION_GRADE_ARN` | — | ARN of the submission-grading trigger queue. The backend publishes here after a student uploads photos. |
 | `SQS_ATTEMPT_REPROCESS_URL` | — | HTTPS URL of the attempt-reprocess queue. `submissionGrader` publishes here so the backend turns grading results into attempts. |
+| `SQS_ADHOC_SOLVE_URL` | — | HTTPS URL of the adhoc-solve queue used by the `adhocSolver` worker (A10) for on-demand scans without guide context. |
+| `SQS_EXERCISE_GENERATE_ARN` | — | ARN of the exercise-generation trigger queue. Triggers the `exerciseGenerator` worker on teacher-initiated B1/B2 AI generation requests. |
+| `SQS_EXERCISE_GENERATE_URL` | — | HTTPS URL of the exercise-generation queue. Used to publish exercise-generation jobs from the backend into the `exerciseGenerator` worker. |
 | `S3_GUIDES_BUCKET` | — | S3 bucket where guide assets (extracted figures, rendered pages) are stored. |
 | `S3_SUBMISSIONS_BUCKET` | — | S3 bucket where student submission photos are stored and read from. |
 

@@ -1,7 +1,7 @@
 ---
-title: "exerciseGenerator: AI Exercise Creation Worker"
+title: "exerciseGenerator: AI Math Exercise Creation Worker"
 sidebarTitle: "Exercise Generator"
-description: "SQS worker that generates new math exercises for a given topic on teacher request, using Claude Haiku with forced tool_use to produce up to 10 structured exercises."
+description: "SQS worker that generates math exercises on teacher request using Claude Haiku forced tool_use, producing up to 10 structured exercises per invocation."
 ---
 
 The `exerciseGenerator` worker creates new math exercises on demand in response to teacher requests. When a teacher asks for additional practice material on a specific subdomain, the backend enqueues a `GenerateExercisesMessage` to the `exercise-generate-queue`. The worker receives it, resolves the subdomain and its parent topic from Postgres, fetches human-readable error descriptions for the requested error codes, and calls `HaikuExerciseGenerator` — a Claude Haiku (claude-haiku-4-5) adapter that uses forced `generate_exercises` tool_use to produce up to 10 fully structured exercises in a single LLM call. Each generated exercise is deduplicated against existing problems and persisted to Postgres with IRT parameters, solution steps, and target error codes. A cost event is recorded after every invocation.

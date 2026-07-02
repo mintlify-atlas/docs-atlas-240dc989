@@ -1,7 +1,7 @@
 ---
-title: "hourlyAlerts: At-Risk Student Detection Worker"
+title: "hourlyAlerts: At-Risk Student Alert Detection Worker"
 sidebarTitle: "Hourly Alerts"
-description: "EventBridge cron worker that scans mastery and guide-submission data hourly, detecting at-risk students and class-level patterns, then writes deduplicated TeacherAlert rows."
+description: "EventBridge cron that scans mastery and guide data hourly, detects at-risk students and class-level patterns, and writes deduplicated TeacherAlert rows."
 ---
 
 `hourlyAlerts` is the platform's real-time risk-detection layer. It runs every hour, pulling the current state of student mastery and guide-submission grading data, and evaluates six detectors against configurable thresholds. Each detector produces `AlertCandidate` objects that are deduplicated before insertion into the `teacher_alerts` table — so a teacher is never shown the same alert twice in a day for the same entity. The worker covers two families of alerts: mastery-based signals (at-risk students, learning drops, off-track units, and widespread topic struggles) derived from BKT `p_known` values, and guide-based signals (grading completion and common submission errors) derived from the v9 guides pipeline. Running hourly rather than nightly means teachers receive actionable notifications within 60 minutes of the underlying data changing.

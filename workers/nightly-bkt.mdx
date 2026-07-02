@@ -1,7 +1,7 @@
 ---
-title: "nightlyBkt: BKT Parameter Calibration Worker"
+title: "nightlyBkt: Bayesian Knowledge Tracing Calibration"
 sidebarTitle: "Nightly BKT"
-description: "EventBridge cron worker that recalibrates BKT parameters for every active skill nightly at 07:00 UTC using brute-force grid search over 30-day attempt history."
+description: "EventBridge cron that recalibrates BKT parameters for every active skill nightly at 07:00 UTC via brute-force grid search over 30-day attempt history."
 ---
 
 `nightlyBkt` is the nightly calibration job that keeps the platform's Bayesian Knowledge Tracing model accurate over time. It runs once every 24 hours, fetches all attempts from the last 30 days for each active skill, and performs a brute-force grid search over the four BKT parameters — `p_l0`, `p_transit`, `p_slip`, and `p_guess` — choosing the combination that maximises the log-likelihood of the observed attempt sequences. The results are upserted into `skill_bkt_params`, which the backend reads on each student attempt to perform the online BKT update. Because the calibration is fully deterministic (scipy + numpy, no LLM calls), the function uses no external API keys and never touches S3.

@@ -1,7 +1,7 @@
 ---
-title: "submissionGrader: Student Work Grading Worker"
+title: "submissionGrader: Handwritten Submission Grading Worker"
 sidebarTitle: "Submission Grader"
-description: "SQS worker that transcribes and grades student photo submissions using Claude Haiku vision, then publishes attempt data back to the attempt-reprocess queue."
+description: "SQS worker that transcribes and grades student photo submissions using Claude Haiku vision, publishing aligned attempt data to the reprocess queue."
 ---
 
 The `submissionGrader` worker is the entry point for grading handwritten student work in the v9 guides pipeline. When a student uploads photos of their solved exercise, the backend enqueues a lightweight `GradeSubmissionMessage` — containing only a `guide_submission_id` — to the `submission-grade-queue`. The worker loads the full submission context (photos, solution key, domain catalog) from Postgres and S3, calls `HaikuVisionGrader` to transcribe the handwriting and align the student's steps against the official pauta, and publishes a `ReprocessMessage` to the `attempt-reprocess-queue` so the backend can create the corresponding attempt records. Submissions that are illegible after one retry are closed as `GRADED` with an illegible note; the student can re-upload. Every call records token usage and estimated cost.

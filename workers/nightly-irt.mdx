@@ -1,7 +1,7 @@
 ---
-title: "nightlyIrt: IRT 2PL Item Calibration Worker"
+title: "nightlyIrt: 2PL IRT Item Parameter Calibration Worker"
 sidebarTitle: "Nightly IRT"
-description: "EventBridge cron worker that fits 2PL IRT parameters for every exercise with ≥50 attempts, running at 07:15 UTC after BKT calibration completes."
+description: "EventBridge cron that fits 2PL IRT discrimination and difficulty parameters for every exercise with ≥50 attempts, running at 07:15 UTC after BKT."
 ---
 
 `nightlyIrt` is the nightly Item Response Theory calibration job. It runs 15 minutes after `nightlyBkt`, once per day, and fits a **2-Parameter Logistic (2PL) IRT model** for every exercise that has accumulated at least 50 attempts. For each qualifying item it fetches the attempt outcomes together with the student's current BKT `p_known` estimate (used as a proxy for latent ability θ), runs maximum-likelihood estimation via L-BFGS-B, and writes back the discrimination `a` and difficulty `b` parameters directly to the `items` table. The backend then uses these parameters to compute Fisher information `I(θ) = a²·P(θ)·(1−P(θ))` for adaptive item selection. Like `nightlyBkt`, this function is purely deterministic — no LLM, no S3, no SQS.

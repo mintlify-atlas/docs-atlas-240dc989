@@ -4,7 +4,7 @@ sidebarTitle: "Testing"
 description: "How to run the Innova AI Engine test suite: unit tests with mocked providers, property-based BKT/IRT tests with Hypothesis, and SQS/S3 integration tests using moto."
 ---
 
-The Innova AI Engine testing strategy is built around a single principle: **pure domain logic is tested deterministically; every external dependency is mocked**. BKT grid search and IRT 2PL MLE are mathematical algorithms with known properties, so they are covered with `hypothesis` property tests that verify parameter recovery. LLM and OCR providers are replaced with fakes that assert the engine sends the correct prompt structure (prompt caching headers, forced `tool_choice`). AWS services (SQS, S3) are emulated in-process with `moto`. Real provider calls are quarantined behind a `smoke` marker and run only on the `main` branch in CI, where API keys are available.
+The Innova AI Engine testing strategy is built around a single principle: **pure domain logic is tested deterministically; every external dependency is mocked**. BKT grid search and IRT 2PL MLE are mathematical algorithms with known properties, so they are covered with `hypothesis` property tests that verify parameter recovery. LLM and OCR providers are replaced with fakes that assert the engine sends the correct prompt structure (prompt caching headers, forced `tool_choice`). AWS services (SQS, S3) are emulated in-process with `moto`. Real provider calls are quarantined behind a `smoke` marker and must be run manually by developers who have live API keys — they are excluded from all CI jobs.
 
 ---
 
@@ -21,7 +21,7 @@ The Innova AI Engine testing strategy is built around a single principle: **pure
     SQS/S3 flows using `moto` — exercises the full handler path including queue polling, S3 uploads, and Postgres writes against in-process AWS mocks.
   </Card>
   <Card title="Smoke Tests" icon="fire">
-    Real Anthropic/Gemini API calls. Marked `@pytest.mark.smoke`. Skipped on PRs; run automatically on `main` branch CI only where secrets are available.
+    Real Anthropic/Gemini API calls. Marked `@pytest.mark.smoke`. Excluded from all CI jobs — must be run manually by a developer with live API keys.
   </Card>
 </CardGroup>
 
@@ -36,7 +36,7 @@ uv run pytest
 # With coverage report (gate: ≥75% required)
 uv run pytest --cov=src
 
-# Real provider API calls — main-branch CI only
+# Real provider API calls — run manually with live API keys
 uv run pytest -m smoke
 
 # Lint — zero issues required
@@ -63,7 +63,7 @@ markers = [
 ]
 ```
 
-Any test that makes a real call to Anthropic or Gemini should be decorated with `@pytest.mark.smoke`. These tests are excluded from the default `uv run pytest` run and from PR CI jobs so that developers without keys can run the full suite locally. They execute automatically on merge to `main` via `ci.yml`, which supplies `ANTHROPIC_API_KEY` and `GEMINI_API_KEY` from GitHub Actions secrets.
+Any test that makes a real call to Anthropic or Gemini should be decorated with `@pytest.mark.smoke`. These tests are excluded from the default `uv run pytest` run and from all CI jobs — `ci.yml` always passes `-m "not smoke"`, so smoke tests must be run manually by a developer who has live API keys available.
 
 ---
 

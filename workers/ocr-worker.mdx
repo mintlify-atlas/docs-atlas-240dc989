@@ -1,7 +1,7 @@
 ---
-title: "ocrWorker: Handwritten Math OCR Worker"
+title: "ocrWorker: Handwritten Math OCR Transcription Worker"
 sidebarTitle: "OCR Worker"
-description: "SQS worker that transcribes handwritten student math submissions using Gemini 2.5 Flash with automatic Claude vision escalation, publishing LaTeX steps to attempt-reprocess queue."
+description: "SQS worker that transcribes handwritten math submissions via Gemini 2.5 Flash with automatic Claude vision escalation, producing structured LaTeX steps."
 ---
 
 The `ocrWorker` converts photos of handwritten student math work into structured LaTeX step sequences. It is triggered by S3 object-creation events forwarded through the `ocr-queue`, downloads the raw image bytes, strips EXIF metadata, and passes the image to `OcrOrchestrator`. The orchestrator first attempts extraction with Gemini 2.5 Flash; if the returned confidence falls below the configured threshold (default 0.7), it escalates automatically to Claude vision. The higher-confidence result is returned as an `OcrResult` containing a list of LaTeX steps, an overall confidence score, the provider that produced the result, an optional topic hint, and an estimated cost in USD. Results are logged and the processed count is returned to Lambda.
